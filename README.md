@@ -1,124 +1,302 @@
-# Local Coding Agent — read-only references, secret filtering, research, and Excel
+# Local Coding Agent
 
-`roots.txt` contains writable directories. They appear as `/workspace/write/rootN`.
+A local coding agent that runs inside a Docker sandbox. It has its own file
+tools, a shell, an Excel workbook engine, and a research sub-agent with web
+access. You talk to it in a browser UI; it works on directories you explicitly
+expose to it.
 
-`readonly_roots.txt` contains reference directories. Docker mounts them `readonly`, and they appear as `/workspace/read/rootN`.
+This README walks you through setting it up from scratch. Follow the steps in
+order. Nothing here requires code changes.
 
-The agent can list/read reference files, but Docker itself prevents writes to those mounts.
+For how the internals work — the sandbox model, the modules, the security
+boundaries — see [ARCHITECTURE.md](ARCHITECTURE.md).
 
-## Architecture
+---
 
-- `agent.py` — the generic reasoning loop `run_agent(messages, tools, max_iterations, handlers, ...)`, shared by the main agent and every sub-agent. `Agent` is the stateful per-session wrapper.
-- `tools.py` — assembles the whole tool surface. Sandbox tools (`list_files`, `read_file`, `write_file`, `apply_patch`, `run_command`), the host tool (`research`), the Excel workbook tools, and the convention-file readers.
-- `research.py` — a research sub-agent exposed to the coding agent as the `research` tool. It runs a nested `run_agent` loop with host-side web tools and returns a concise, source-cited summary.
-- `web.py` — host-side `web_search` / `fetch_page`. The sandbox runs with `--network none`, so web access happens in the trusted host process. Uses the optional `crw` binary; degrades gracefully if absent.
-- `excel_tools.py` — host-side `excel_*` tools. Ships the workbook engine into the running sandbox and drives it with a JSON request per call.
-- `excel/xlsx.py` — a standard-library-only OOXML reader/writer. This is why Excel works in a network-disabled container: no `pip install openpyxl`, no image rebuild.
-- `excel/engine.py` — the sandbox-side driver. All workbook file I/O happens here, inside the container, so the `/workspace/write` policy still applies.
-- `excel/knowledge_tools.py` — `read_excel_guide`, `read_research_guide`, `read_research_notes`, `append_research_notes`. These read the editable Markdown in `knowledge/`.
-- `excel/excel_test.py` — 40 self-checks for the engine. Runs in the sandbox with stock Python.
-- `knowledge/` — the convention files you edit. `EXCEL_GUIDE.md`, `RESEARCH_GUIDE.md`, `RESEARCH_NOTES.md`.
-- `bootstrap_excel.py` — verifies the knowledge files and engine are in place. `--check` reports only.
-- `app.py` — Flask UI with Chat / Agent / Tools / Knowledge tabs and an SSE event stream.
+## What you are building
 
-A sub-agent is just another call to `run_agent` with its own `messages`, `tools`, and `handlers`. That is what lets `research` run nested inside the coding agent without any special casing.
+The app runs on your computer. When the agent writes files or runs commands, it
+does so inside a Docker container, not on your real machine. You choose which of
+your folders the container can see:
 
-## Excel
+- **Writable roots** — folders the agent can read and write. Any file the agent
+  creates lands here on your real disk.
+- **Read-only roots** — folders the agent can read but not modify. Use these for
+  reference material (a codebase to look at, documents to read).
 
-The agent builds workbooks with five tools:
+You set these up with two text files: `roots.txt` and `readonly_roots.txt`.
 
-| Tool | Purpose |
-| --- | --- |
-| `excel_create` | New `.xlsx` with a populated Cover sheet |
-| `excel_write_sheet` | Write a table (headers, rows, formats, widths) to a sheet |
-| `excel_edit_cells` | Write individual cells; corrections and totals rows |
-| `excel_read` | Inspect headers, dimensions, number formats, row preview |
-| `excel_list_sheets` | Sheet names, row counts, headers |
+---
 
-Number formats are passed as aliases — `currency`, `usd2`, `percent`, `percent2`,
-`multiple`, `date`, `datetime`, `int`, `number`, `number2`, `signed_pct`,
-`signed_num`, `text` — or as a raw Excel format code. Numeric-looking strings
-(`"1,250"`, `"31.8%"`, `"$24,560"`) are coerced to real numbers, because an LLM
-will otherwise write `"1,250"` and silently destroy the column's type.
+## Before you start
 
-The engine is copied into the container at `/tmp/.excel_engine` on first use and
-overwritten on every call, so editing `excel/xlsx.py` takes effect immediately
-with no restart.
+You need three things installed. Check each with the command shown.
 
-**Why not openpyxl.** The sandbox runs `--network none`, so `pip install` fails.
-Vendoring openpyxl would mean shipping roughly a megabyte of dependency tree into
-the context-adjacent state and rebuilding an image to change it. The native writer
-is ~700 lines of standard library, covers typed cells, per-column number formats,
-frozen panes, column widths, shared strings and formulas, and is identical to edit
-and to review. The tradeoff is honest: no charts, no pivot tables, no formula
-evaluation (formulas are stored; `excel_read` reports the cached value).
+**1. Python 3.10 or newer**
+```bash
+python3 --version
+```
+If that fails or shows an older version, install Python from python.org.
 
-## Knowledge files
+**2. Docker Desktop**
+```bash
+docker --version
+```
+Then make sure Docker is actually **running** (open Docker Desktop and wait for
+it to say it's running). The app will not start without it. Docker Desktop is
+free for personal use — download from docker.com.
 
-`knowledge/EXCEL_GUIDE.md` and `knowledge/RESEARCH_GUIDE.md` are plain Markdown
-that you maintain. The agent never loads them automatically. Its system prompt
-names the tools and the moment to call them, so the conventions cost nothing until
-an Excel or research task begins:
+**3. A DeepSeek API key**
+Go to platform.deepseek.com, create an account, and generate an API key. It
+looks like `sk-...`. Keep this window open; you'll paste the key in step 3.
 
-- `read_excel_guide` — before the first `excel_*` call in a task. Sheet layout,
-  number formats, naming, reported-versus-estimated colouring, verification list.
-- `read_research_guide` — before a research or data-compilation task. Source
-  hierarchy (SEC EDGAR, XBRL company facts, filings), fetch rules and rate limits,
-  build order, known traps.
-- `read_research_notes` — your standing context: coverage universe, house metric
-  definitions, prior conclusions.
-- `append_research_notes` — the agent can record a durable finding. Keep in mind it
-  writes to the same file you edit.
+Optional: **`crw`** — a command-line web scraper. Only needed if you want the
+research feature to search and fetch web pages. Without it, everything else
+works and research returns a clear "web tools unavailable" message. You can skip
+this and add it later.
 
-Point `EXCEL_KNOWLEDGE_DIR` at a different directory if you would rather keep these
-outside the app directory. `KNOWLEDGE_MAX_CHARS` caps how much of a file is returned.
+---
 
-## Secret protection
+## Step 1 — Get the code onto your machine
 
-Known secret-bearing files are blocked by `access.py`, including `.env*`, `.pem`, `.key`, `.p12`, `.pfx`, `.npmrc`, `.pypirc`, `.netrc`, common credential files, and sensitive directories such as `.ssh` and `.aws`.
-
-Returned file/command output also passes through regex-based secret redaction.
-
-Important: embedded secrets in arbitrary source files cannot be detected perfectly. Regex redaction is defense in depth, not a proof of safety. The strongest protection is not placing secrets in files exposed to the agent at all.
-
-To prevent the generic command tool from bypassing filtering with `cat`, Python, etc., `run_command` is prohibited from directly referencing `/workspace/read`; reference files must go through `read_file`/`list_files`.
-
-The `excel_*` tools route every write through `AccessPolicy.assert_write`, so a
-workbook cannot be created outside `/workspace/write`.
-
-## Configuration
-
-Environment variables (see `config.py`; put them in `.env`):
-
-- `DEEPSEEK_API_KEY` (required), `DEEPSEEK_MODEL`, `DEEPSEEK_BASE_URL`
-- `MAX_ITERATIONS` (main agent), `RESEARCH_MAX_ITERATIONS` (research sub-agent)
-- `MAX_HISTORY`, `MAX_TOOL_OUTPUT`
-- `AGENT_IMAGE`, `HOST`, `PORT`
-- `EXCEL_KNOWLEDGE_DIR`, `KNOWLEDGE_MAX_CHARS`, `KNOWLEDGE_MAX_NOTE_CHARS`
-
-Web research requires the `crw` binary on the host PATH (or at `/usr/local/bin/crw`, `/home/*/.local/bin/crw`). Without it, `research` returns a clear "unavailable" message and the rest of the agent still works. Excel does not need `crw` and works with no network at all.
-
-## Setup
-
-1. Put writable/output folders in `roots.txt`.
-2. Put reference folders in `readonly_roots.txt`.
-3. Keep your actual `.env` outside all exposed roots where practical.
-4. Optionally edit `knowledge/EXCEL_GUIDE.md` to your house conventions.
-5. Run `python3 bootstrap_excel.py --check` to confirm the guides and engine are present.
-6. Run `python3 app.py`.
-
-The Docker sandbox remains network-disabled and capability-restricted.
-
-## Verification
-
-There is no Docker in a bare checkout, so the checks are layered. Run them after
-any change to the Excel stack:
+Download the project folder (or `git clone` it) and open a terminal in it:
 
 ```bash
-cd excel        && python3 excel_test.py      # 40 engine round-trip checks
-cd excel        && python3 -S -E excel_test.py  # same, with no site-packages
+cd /path/to/LocalCodingAgent4_Modern
 ```
 
-With Docker running and the app started, the live path is exercised by asking the
-agent for a workbook and confirming `excel_read` reports the expected sheets and
-formats. `bootstrap_excel.py --check` covers the file layout.
+Everything below assumes you are in this folder. Confirm you can see the files:
+
+```bash
+ls
+```
+You should see `app.py`, `config.py`, `requirements.txt`, and others.
+
+---
+
+## Step 2 — Install the Python packages
+
+```bash
+python3 -m pip install -r requirements.txt
+```
+
+That installs three packages (Flask, python-dotenv, and the OpenAI client
+library). If `pip` complains about permissions, use a virtual environment:
+
+```bash
+python3 -m venv .venv
+source .venv/bin/activate        # Windows: .venv\Scripts\activate
+python3 -m pip install -r requirements.txt
+```
+
+If you use a virtual environment, run every later `python3` command with it
+active.
+
+---
+
+## Step 3 — Create your `.env` file (holds your API key)
+
+The project does **not** ship with a `.env` file — you make it. It holds your
+secret API key and is ignored by git, so it will never be uploaded anywhere.
+
+Create a file named exactly `.env` in the project folder (same folder as
+`app.py`). Put this inside it:
+
+```
+DEEPSEEK_API_KEY=sk-paste-your-real-key-here
+```
+
+That is the only line you strictly need. Replace the placeholder with your real
+key from the DeepSeek website.
+
+> **Keep `.env` at the top level of the project folder.** The sandbox blanks any
+> file named `.env` it finds at the top of a mounted folder, so your key stays
+> hidden from the agent. It does *not* reach into nested subfolders — so never
+> put `.env` inside a subfolder that is itself inside a mounted root.
+
+Optional extra settings you can add on their own lines (defaults are fine for a
+first run):
+
+```
+DEEPSEEK_MODEL=deepseek-chat
+DEEPSEEK_BASE_URL=https://api.deepseek.com
+PORT=5001
+AGENT_IMAGE=python:3.12-slim
+```
+
+---
+
+## Step 4 — Create `roots.txt` (the folders the agent can write to)
+
+Create a file named `roots.txt` in the project folder. Each line is **one
+absolute folder path** — a folder you want the agent to be able to read and
+write. Lines starting with `#` are comments.
+
+```
+# One absolute host directory per line.
+# Each is mounted read/write as /workspace/write/rootN.
+/Users/yourname/Documents/agent_output
+```
+
+Points that matter:
+
+- Paths must start with `/` (on Mac/Linux) or a drive letter (on Windows, e.g.
+  `C:/Users/yourname/Documents/agent_output`).
+- The folder must already exist. Create it first if needed:
+  `mkdir -p ~/Documents/agent_output`.
+- You can list as many folders as you want, one per line.
+- If you also list the project folder itself here, that's fine — the `.env` at
+  its top level is automatically hidden from the agent.
+
+---
+
+## Step 5 — Create `readonly_roots.txt` (optional reference folders)
+
+Create a file named `readonly_roots.txt` in the project folder. Same format, but
+these folders are mounted **read-only** — the agent can read them, never change
+them. Use this for anything you want the agent to consult but not touch.
+
+```
+# Optional read-only reference directories, one absolute host directory per line.
+# Each is mounted read-only as /workspace/read/rootN.
+/Users/yourname/Documents/Projects
+```
+
+This file is optional. If you don't need reference material, create it empty
+with just the comment lines. **The agent's own project folder is a good thing to
+put here** so it can read its own code.
+
+One rule: a read-only root cannot be the same as, or sit inside, a writable
+root (or vice versa). The app will refuse to start and tell you if you do this.
+
+---
+
+## Step 6 — Check your setup
+
+```bash
+python3 bootstrap_excel.py --check
+```
+
+This reports whether the built-in Excel engine and the knowledge files are in
+place. You want it to end with `0 problem(s)`. If something is reported MISSING,
+the message tells you what to fix — usually a file didn't download correctly.
+
+---
+
+## Step 7 — Start the app
+
+```bash
+python3 app.py
+```
+
+The first start can take a minute: Docker downloads a small Python image the
+first time. When it's ready you'll see a line like:
+
+```
+Running on http://0.0.0.0:5001
+```
+
+Open **http://localhost:5001** in your browser. You'll see a chat window.
+
+---
+
+## Step 8 — Use it
+
+Click **New session**, type what you want, and press Send. For example:
+
+> Create a folder called `notes` in the output directory and add a file called
+> `hello.txt` with the text "it works".
+
+The agent will use its tools and create the file inside your writable root. Check
+your real folder — the file should be there.
+
+The tabs at the top show what's happening:
+
+- **Chat** — just your conversation.
+- **Agent** — every step the agent takes, including its reasoning.
+- **Tools** — every tool call and its result (file writes, shell commands).
+- **Roots** — change which folders are exposed, from the UI instead of editing
+  the text files. Clicking Save rebuilds the sandbox with the new folders and
+  rewrites `roots.txt` / `readonly_roots.txt` for you.
+
+---
+
+## Optional — turn on web research
+
+The research feature needs the `crw` command-line tool on your computer.
+
+1. Install `crw` (follow its own instructions).
+2. Confirm it's found:
+   ```bash
+   which crw
+   ```
+   If that prints nothing, either add it to your PATH or place it at
+   `/usr/local/bin/crw`.
+3. Restart the app. The agent can now search and fetch pages.
+
+Without `crw`, everything except web research works normally.
+
+---
+
+## Optional — customize the Excel and research conventions
+
+The folder `knowledge/` contains three Markdown files:
+
+- `EXCEL_GUIDE.md` — how workbooks should be laid out (sheets, number formats,
+  colours). The agent reads it before building a spreadsheet.
+- `RESEARCH_GUIDE.md` — how research should be done and cited.
+- `RESEARCH_NOTES.md` — your own standing notes; the agent can read and append
+  to it.
+
+These are plain text. Edit them to match your preferences — no coding required.
+The agent only reads them when a relevant task comes up, so they cost nothing
+until needed.
+
+---
+
+## Troubleshooting
+
+**"Docker is unavailable" or the app won't start.**
+Docker Desktop isn't running. Open it, wait for it to be ready, and start the
+app again. The app retries automatically, so you don't need to change anything.
+
+**"DEEPSEEK_API_KEY is required in .env".**
+Your `.env` file is missing, misnamed (it must be exactly `.env`, not
+`env.txt`), or doesn't contain the `DEEPSEEK_API_KEY=...` line. Fix and restart.
+
+**"Missing roots.txt" or "roots.txt contains no roots".**
+Create `roots.txt` in the project folder with at least one absolute folder path,
+each on its own line.
+
+**"Root must be absolute" or "Root is not a directory".**
+A path in `roots.txt` is wrong. It must start with `/` (or `C:/` on Windows) and
+the folder must exist.
+
+**"Writable and read-only roots may not overlap".**
+One of your `readonly_roots.txt` folders is the same as, or inside, a
+`roots.txt` folder. Move one of them so they don't overlap.
+
+**The agent can't see my files / writes go to the wrong place.**
+Check the **Roots** tab. The folders listed there are the only ones the agent can
+reach. Add what's missing and click Save.
+
+**Files the agent creates aren't in my folder.**
+They're written inside the writable root, under `/workspace/write/rootN`, which
+maps to the folder you listed in `roots.txt`. Open that folder on your disk.
+
+**Research says "web tools unavailable".**
+`crw` isn't installed or isn't on your PATH. See the research section above.
+
+---
+
+## Reference — every file you need to create
+
+| File | Required? | What goes in it |
+| --- | --- | --- |
+| `.env` | Yes | `DEEPSEEK_API_KEY=sk-...` (your key). No other file needed. |
+| `roots.txt` | Yes | One absolute folder path per line — folders the agent can write to. |
+| `readonly_roots.txt` | No | One absolute folder path per line — folders the agent can only read. |
+| `knowledge/*.md` | No | Optional; edit to customize Excel/research behavior. Shipped with the project. |
+
+The app refuses to start without a valid `.env` and a non-empty `roots.txt`.
+Everything else is optional.
