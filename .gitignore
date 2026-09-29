@@ -1,0 +1,42 @@
+# --- secrets ---
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+*.pfx
+.netrc
+.npmrc
+.pypirc
+credentials.json
+
+# --- local machine state / private paths ---
+roots.txt
+readonly_roots.txt
+readonly_roots_allpaths.txt
+*roots*.txt
+.agent/
+.PLAN.json
+
+# --- your proprietary research notes (app edits this file) ---
+knowledge/RESEARCH_NOTES.md
+
+# --- python ---
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+env/
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# --- os / editor ---
+.DS_Store
+.idea/
+.vscode/
+*.swp
+
+.sandbox_placeholders/
