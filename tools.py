@@ -36,16 +36,22 @@ WHOLE_FILE_LINES = 1200
 PATCH_ROOT = "write"
 
 
-def _clip(text: str, limit: int) -> str:
-    text = redact_secrets(text)
+def _clip(text: str, limit: int, path: str | None = None) -> str:
+    """Redact, then truncate. `path` selects the redaction profile by extension.
+
+    A missing/unknown path falls back to the strict profile, so an unfiltered
+    caller is never silently relaxed.
+    """
+    text = redact_secrets(text, path)
     if len(text) <= limit:
         return text
     return text[:limit] + f"\n...[truncated {len(text) - limit} characters]"
 
 
-def _render_window(body: str, limit: int, first_line: int, total_lines: int) -> str:
+def _render_window(body: str, limit: int, first_line: int, total_lines: int,
+                   path: str | None = None) -> str:
     """Clip a line-addressed window, reporting position against the FILE."""
-    body = redact_secrets(body)
+    body = redact_secrets(body, path)
     lines = body.splitlines(keepends=True)
     last_shown = first_line + len(lines) - 1 if lines else first_line
 
@@ -94,13 +100,27 @@ def _patch_target(line: str) -> str | None:
     return normalized
 
 
+def _code_hint(path: str, glob: str | None = None) -> bool | None:
+    """Explicit profile override for a multi-file read, or None to use the path.
+
+    `grep`/`run_command` return output blended across files, so there is no
+    single extension to key on. When a `glob` pins the read to one file type we
+    honor it; otherwise the caller decides. Returning None defers to the strict
+    default rather than guessing, so an unknown mix is never relaxed.
+    """
+    if glob and "." in glob:
+        from access import profile_for
+        return profile_for(glob) == "code"
+    return None
+
+
 def definitions() -> list[dict[str, Any]]:
     """Tool schema advertised to the model."""
     return [
         {"type": "function", "function": {"name": "list_files", "description": "List files/directories in an allowed workspace path. Sensitive filenames may be visible but their contents cannot be read.", "parameters": {"type": "object", "properties": {"path": {"type": "string"}, "max_depth": {"type": "integer", "minimum": 1, "maximum": 8}}, "required": ["path"], "additionalProperties": False}}},
         {"type": "function", "function": {"name": "grep", "description": "Search file contents with ripgrep and return matching lines with numbers. PREFER THIS over read_file to locate a symbol, function, or string: it returns the ~20 relevant lines instead of whole files.", "parameters": {"type": "object", "properties": {"pattern": {"type": "string", "description": "Regex to search for"}, "path": {"type": "string", "description": "File or directory to search; defaults to /workspace/write"}, "glob": {"type": "string", "description": "Optional file glob, e.g. '*.py'"}, "ignore_case": {"type": "boolean"}}, "required": ["pattern"], "additionalProperties": False}}},
         {"type": "function", "function": {"name": "outline", "description": "Structural outline of a source file (classes, functions, methods with line numbers) without reading the bodies. Use to decide which lines to read. Python is parsed via AST; other languages fall back to a definition-pattern scan.", "parameters": {"type": "object", "properties": {"path": {"type": "string"}}, "required": ["path"], "additionalProperties": False}}},
-        {"type": "function", "function": {"name": "read_file", "description": "Read a text file from writable or read-only workspace roots. Small files are returned whole. Large files return a line window starting at `offset` (0-based) and report exactly which lines were shown against the file's true length, so paging is reliable. Known secret files are blocked and embedded secrets are redacted.", "parameters": {"type": "object", "properties": {"path": {"type": "string"}, "offset": {"type": "integer", "minimum": 0, "description": "0-based first line to return. Default 0."}, "limit": {"type": "integer", "minimum": 0, "description": "Max lines to return. Default 500. Use 0 to request the whole file (still capped by the server)."}}, "required": ["path"], "additionalProperties": False}}},
+        {"type": "function", "function": {"name": "read_file", "description": "Read a text file from writable or read-only workspace roots. Small files are returned whole. Large files return a line window starting at `offset` (0-based) and report exactly which lines were shown against the file's true length, so paging is reliable. Known secret files are blocked. Source-code files are returned verbatim; other files have embedded secrets redacted.", "parameters": {"type": "object", "properties": {"path": {"type": "string"}, "offset": {"type": "integer", "minimum": 0, "description": "0-based first line to return. Default 0."}, "limit": {"type": "integer", "minimum": 0, "description": "Max lines to return. Default 500. Use 0 to request the whole file (still capped by the server)."}}, "required": ["path"], "additionalProperties": False}}},
         {"type": "function", "function": {"name": "write_file", "description": "Create or replace a text file. Only /workspace/write is writable. For files larger than a few thousand tokens, write in chunks: create the file with the first chunk, then append further chunks with run_command (e.g. cat >> path <<'EOF'), because a single oversized call can exceed the output token limit and be rejected.", "parameters": {"type": "object", "properties": {"path": {"type": "string"}, "content": {"type": "string"}}, "required": ["path", "content"], "additionalProperties": False}}},
         {"type": "function", "function": {"name": "apply_patch", "description": "Apply a unified diff to a writable root. The patch must target paths beneath /workspace/write.", "parameters": {"type": "object", "properties": {"patch": {"type": "string"}}, "required": ["patch"], "additionalProperties": False}}},
         {"type": "function", "function": {"name": "run_command", "description": "Run a shell command with /workspace/write as the working area. Only allowlisted programs may be invoked (SAFE_COMMANDS); reads of /workspace/read are rejected. Returns JSON {exit_code, stdout, stderr}.", "parameters": {"type": "object", "properties": {"command": {"type": "string"}, "timeout": {"type": "integer", "minimum": 1, "maximum": 600}}, "required": ["command"], "additionalProperties": False}}},
@@ -207,13 +227,16 @@ def sandbox_handlers(workspace: DockerWorkspace, max_output: int) -> dict[str, C
     name check: `assert_content_allowed` rejects secret *filenames* before the
     read, and `assert_no_secrets` rejects secret *content* after it. The second
     check is what covers a secret file that was copied to an innocuous name.
+    Both content checks are profile-aware: source-code extensions use the
+    relaxed "code" profile (no assignment-shape false positives), everything
+    else stays strict.
     """
 
     def list_files(path: str, max_depth: int = 3) -> str:
         POLICY.assert_read(path)
         cmd = f"find {shlex.quote(path)} -maxdepth {int(max_depth)} -mindepth 1 -print | sort"
         r = workspace.execute(cmd)
-        return _clip(str(r["stdout"]) + str(r["stderr"]), max_output)
+        return _clip(str(r["stdout"]) + str(r["stderr"]), max_output, path)
 
     def grep(pattern: str, path: str = "/workspace/write", glob: str | None = None,
              ignore_case: bool = False) -> str:
@@ -228,8 +251,9 @@ def sandbox_handlers(workspace: DockerWorkspace, max_output: int) -> dict[str, C
         if r["exit_code"] not in (0, 1):  # 1 = no matches, not an error
             raise RuntimeError(str(r["stderr"]) or "rg failed")
         out = str(r["stdout"]) or "(no matches)"
-        assert_no_secrets(out, f"grep of {path}")
-        return _clip(out, max_output)
+        # Output spans files: honor an explicit code glob, else stay strict.
+        assert_no_secrets(out, f"grep of {path}", code=_code_hint(path, glob))
+        return _clip(out, max_output, path)
 
     def outline(path: str) -> str:
         POLICY.assert_read(path)
@@ -264,7 +288,7 @@ def sandbox_handlers(workspace: DockerWorkspace, max_output: int) -> dict[str, C
             raise RuntimeError(str(r["stderr"]))
         out = str(r["stdout"]).strip() or "(no definitions found)"
         assert_no_secrets(out, path)
-        return _clip(f"{path}:\n{out}", max_output)
+        return _clip(f"{path}:\n{out}", max_output, path)
 
     def read_file(path: str, offset: int = 0, limit: int = DEFAULT_READ_LINES) -> str:
         POLICY.assert_read(path)
@@ -293,7 +317,7 @@ def sandbox_handlers(workspace: DockerWorkspace, max_output: int) -> dict[str, C
 
         body = str(r["stdout"]).strip("\n")
         assert_no_secrets(body, path)
-        return _render_window(body, max_output, start + 1, total_lines)
+        return _render_window(body, max_output, start + 1, total_lines, path)
 
     def write_file(path: str, content: str) -> str:
         POLICY.assert_write(path)
@@ -326,6 +350,7 @@ def sandbox_handlers(workspace: DockerWorkspace, max_output: int) -> dict[str, C
         # check_command is a token-level guard, not a proof: it cannot see
         # content assembled inside python3/node. Redact the result whenever the
         # command has a plausible read path, so this channel is filtered too.
+        # No single file to key on, so this stays strict.
         if is_read_command(command):
             assert_no_secrets(str(r.get("stdout", "")), f"run_command: {command}")
             assert_no_secrets(str(r.get("stderr", "")), f"run_command: {command}")

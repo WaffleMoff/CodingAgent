@@ -24,6 +24,13 @@ BLOCKED_HINT = (
     "the arguments to satisfy the stated reason, or take a different approach."
 )
 
+# Appended as the tool result for a call the loop aborted before running, so the
+# history keeps one tool message per tool_call and stays a valid request.
+ABORTED_RESULT = (
+    "The run was interrupted before this tool call was executed. It was not run. "
+    "Re-issue it (or a corrected form) if it is still needed."
+)
+
 
 def _legacy_hooks(gate: Any, compact: bool) -> Any:
     """Adapt the old `gate` + `compact` arguments onto the Hooks registry.
@@ -46,6 +53,30 @@ def _legacy_hooks(gate: Any, compact: bool) -> Any:
         elif callable(gate):
             hooks.register("stop", gate)
     return hooks
+
+
+def _drain_tool_calls(
+    remaining: list[Any],
+    messages: list[dict[str, Any]],
+    emit: Callable[[str, dict[str, Any]], None],
+) -> None:
+    """Answer every not-yet-executed tool call with a placeholder tool message.
+
+    The chat API requires one `tool` message per entry in a preceding assistant
+    message's `tool_calls`. When the loop stops early (cancellation, or an
+    exception escaping the per-call handler) the assistant message is already in
+    `messages`, so the remaining calls must still be answered or the whole
+    history becomes an invalid request and every later turn is rejected with
+    "Messages with role 'tool' must be a response to a preceding message with
+    'tool_calls'". This closes that gap.
+    """
+    for call in remaining:
+        emit("tool_result", {"name": call.function.name, "result": ABORTED_RESULT})
+        messages.append({
+            "role": "tool",
+            "tool_call_id": call.id,
+            "content": ABORTED_RESULT,
+        })
 
 
 def run_agent(
@@ -151,49 +182,67 @@ def run_agent(
             emit("final", {"content": response.content or ""})
             return response.content or ""
 
-        for call in response.tool_calls:
-            if cancelled():
-                emit("error", {"message": "Agent cancelled"})
-                return "Agent cancelled."
+        # Execute the calls in order. Every exit from this block must leave one
+        # `tool` message per call in the assistant message, or the history is
+        # invalid for the next request; that is what the `finally` guarantees.
+        aborted = False
+        try:
+            for index, call in enumerate(response.tool_calls):
+                if cancelled():
+                    emit("error", {"message": "Agent cancelled"})
+                    aborted = True
+                    return "Agent cancelled."
 
-            name = call.function.name
-            raw_args = call.function.arguments or "{}"
-            try:
-                args = json.loads(raw_args)
-            except json.JSONDecodeError as exc:
-                args = {}
-                if truncated:
-                    result = f"{TRUNCATION_HINT}\n\n(json error: {exc})"
+                name = call.function.name
+                raw_args = call.function.arguments or "{}"
+                try:
+                    args = json.loads(raw_args)
+                except json.JSONDecodeError as exc:
+                    args = {}
+                    if truncated:
+                        result = f"{TRUNCATION_HINT}\n\n(json error: {exc})"
+                    else:
+                        result = (
+                            f"Invalid JSON tool arguments: {exc}. The call was not "
+                            "executed. Re-send the call with well-formed JSON, and "
+                            "split large payloads across multiple calls."
+                        )
+                    emit("tool_call", {"name": name, "arguments": args})
                 else:
-                    result = (
-                        f"Invalid JSON tool arguments: {exc}. The call was not "
-                        "executed. Re-send the call with well-formed JSON, and "
-                        "split large payloads across multiple calls."
-                    )
-                emit("tool_call", {"name": name, "arguments": args})
-            else:
-                emit("tool_call", {"name": name, "arguments": args})
+                    emit("tool_call", {"name": name, "arguments": args})
 
-                blocked = hooks.fire_pre_tool_use(name, args, messages)
-                if blocked:
-                    emit("hook_block", {"name": name, "reason": blocked})
-                    result = f"{blocked}\n\n{BLOCKED_HINT}"
-                else:
-                    handler = handlers.get(name)
-                    try:
-                        result = handler(**args) if handler else f"Unknown tool: {name}"
-                    except Exception as exc:
-                        result = f"Tool error: {exc}"
-                    addition = hooks.fire_post_tool_use(name, args, result, messages)
-                    if addition:
-                        result = f"{result}\n\n{addition}"
+                    blocked = hooks.fire_pre_tool_use(name, args, messages)
+                    if blocked:
+                        emit("hook_block", {"name": name, "reason": blocked})
+                        result = f"{blocked}\n\n{BLOCKED_HINT}"
+                    else:
+                        handler = handlers.get(name)
+                        try:
+                            result = handler(**args) if handler else f"Unknown tool: {name}"
+                        except Exception as exc:
+                            result = f"Tool error: {exc}"
+                        addition = hooks.fire_post_tool_use(name, args, result, messages)
+                        if addition:
+                            result = f"{result}\n\n{addition}"
 
-            emit("tool_result", {"name": name, "result": result})
-            messages.append({
-                "role": "tool",
-                "tool_call_id": call.id,
-                "content": result,
-            })
+                emit("tool_result", {"name": name, "result": result})
+                messages.append({
+                    "role": "tool",
+                    "tool_call_id": call.id,
+                    "content": result,
+                })
+                answered = index + 1
+        finally:
+            # On an early exit (cancellation here, or an uncaught exception from
+            # a hook/handler) the assistant's tool_calls are only partly
+            # answered. Answer the remainder with a placeholder so the next
+            # request stays valid.
+            answered = locals().get("answered", 0)
+            if answered < len(response.tool_calls):
+                _drain_tool_calls(response.tool_calls[answered:], messages, emit)
+
+        if aborted:
+            return "Agent cancelled."
 
     emit("error", {"message": f"Agent exceeded {max_iterations} iterations"})
     return "Agent exceeded maximum iterations."
