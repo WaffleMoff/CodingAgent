@@ -193,6 +193,23 @@ def fidelity_messages(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
 
 # --- compaction -----------------------------------------------------------
 
+def _safe_split(messages: list[dict[str, Any]], tail_len: int) -> int:
+    """Return the index at which the kept tail may start.
+
+    A `tool` message is only valid immediately after the assistant message that
+    issued its `tool_calls`. Slicing by a fixed count can land the tail on a
+    bare `tool` message, orphaning it and making every later request fail with
+    "Messages with role 'tool' must be a response to a preceding message with
+    'tool_calls'". So walk the split point backwards: if the message at the
+    boundary is a `tool` reply, move the boundary up to its assistant parent so
+    the whole tool exchange is kept together in the tail.
+    """
+    split = max(1, len(messages) - tail_len)
+    while split > 1 and messages[split].get("role") == "tool":
+        split -= 1
+    return split
+
+
 def compact(messages: list[dict[str, Any]], llm: Any, hooks: Any | None = None) -> bool:
     """Compact `messages` in place. Returns True if anything was collapsed.
 
@@ -203,8 +220,11 @@ def compact(messages: list[dict[str, Any]], llm: Any, hooks: Any | None = None) 
         return False
 
     head = messages[0]
-    tail = messages[-COMPACT_KEEP_RECENT:]
-    middle = messages[1 : len(messages) - COMPACT_KEEP_RECENT]
+    split = _safe_split(messages, COMPACT_KEEP_RECENT)
+    tail = messages[split:]
+    middle = messages[1:split]
+    if not middle:
+        return False
 
     extra = ""
     if hooks is not None:
