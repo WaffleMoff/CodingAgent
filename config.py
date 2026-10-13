@@ -25,7 +25,22 @@ API_KEY = os.getenv("DEEPSEEK_API_KEY")
 MAX_ITERATIONS = int(os.getenv("MAX_ITERATIONS", "100"))
 RESEARCH_MAX_ITERATIONS = int(os.getenv("RESEARCH_MAX_ITERATIONS", "60"))
 MAX_HISTORY = int(os.getenv("MAX_HISTORY", "5000"))
+
+# Two output budgets, deliberately separate.
+#
+# MAX_TOOL_OUTPUT caps every tool result by default: list output, grep, command
+# stdout, knowledge files. Keep it tight - it is the blast radius of a single
+# tool call on the context.
+#
+# MAX_READ_OUTPUT is the budget for read_file on a SOURCE-CODE file. Code files
+# are the one case where a single call must be able to return the whole thing:
+# an edit cannot be trusted against a file the model only half-read. A 3000-line
+# file is ~90k characters, so a 30k cap made a whole-file read impossible and
+# forced multi-window paging (and, worse, blind rewrites). 120k covers almost
+# every hand-written source file in one call and is ~30k tokens - comfortable
+# under COMPACT_AT_TOKENS. Non-code and unknown files stay on MAX_TOOL_OUTPUT.
 MAX_TOOL_OUTPUT = int(os.getenv("MAX_TOOL_OUTPUT", "30000"))
+MAX_READ_OUTPUT = int(os.getenv("MAX_READ_OUTPUT", "120000"))
 
 # Research output-contract enforcement. After the research sub-agent produces an
 # answer, research.py checks coverage and citations. On failure it feeds the
@@ -38,6 +53,12 @@ RESEARCH_VERIFY_PASSES = int(os.getenv("RESEARCH_VERIFY_PASSES", "2"))
 # re-injects durable state (plan, writes log, git status) before each model call
 # once the rendered history crosses COMPACT_AT_TOKENS. Off -> the loop sends
 # history unchanged.
+#
+# COMPACT_AT_TOKENS must stay comfortably above MAX_READ_OUTPUT/4 tokens, so a
+# single whole-file code read does not by itself trip compaction. At the 120k
+# default read budget that is 30k tokens against a 60k threshold - fine. If you
+# raise MAX_READ_OUTPUT, raise this in step (rule of thumb: >= 2x the read budget
+# in tokens).
 COMPACT_ENABLED = os.getenv("COMPACT_ENABLED", "on").strip().lower() != "off"
 COMPACT_AT_TOKENS = int(os.getenv("COMPACT_AT_TOKENS", "60000"))
 COMPACT_KEEP_RECENT = int(os.getenv("COMPACT_KEEP_RECENT", "8"))

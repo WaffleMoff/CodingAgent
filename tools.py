@@ -6,8 +6,8 @@ import shlex
 from pathlib import PurePosixPath
 from typing import Any, Callable
 
-from access import AccessPolicy, assert_no_secrets, redact_secrets
-from config import AGENT_PLAN_PATH
+from access import AccessPolicy, assert_no_secrets, profile_for, redact_secrets
+from config import AGENT_PLAN_PATH, MAX_READ_OUTPUT
 from excel.knowledge_tools import TOOLS as KNOWLEDGE_TOOLS
 from excel.knowledge_tools import handlers as knowledge_handlers
 from excel_tools import ExcelBridge
@@ -27,9 +27,21 @@ POLICY = AccessPolicy()
 # enforced in shell_policy.check_command, not merely defined.
 from shell_policy import SAFE_COMMANDS  # re-exported for callers that imported it here
 
-# Lines returned by read_file when the caller omits `limit`.
+# Line limits for read_file.
+#
+# DEFAULT_READ_LINES is what a caller gets when it omits `limit` - a bounded
+# window, not the whole file, so an accidental read of a huge file cannot flood
+# the context.
+#
+# MAX_READ_LINES is the hard backstop that stops a pathological single read (a
+# generated 100k-line file) from ever being requested, independent of the
+# character budget. It is generous enough that between it and MAX_READ_OUTPUT a
+# whole-file read of any normal source file succeeds in one call.
+#
+# Setting `limit=0` means "as much as the budget allows", i.e. up to
+# MAX_READ_LINES lines AND up to the character budget.
 DEFAULT_READ_LINES = 500
-MAX_READ_LINES = 2000
+MAX_READ_LINES = 8000
 WHOLE_FILE_LINES = 1200
 
 # Everything a patch may touch lives under this path, relative to /workspace.
@@ -48,13 +60,33 @@ def _clip(text: str, limit: int, path: str | None = None) -> str:
     return text[:limit] + f"\n...[truncated {len(text) - limit} characters]"
 
 
+def _read_budget(path: str, max_output: int) -> int:
+    """Character budget for a read_file call.
+
+    Source-code files spend the dedicated read budget (MAX_READ_OUTPUT); every
+    other file type stays on the general tool-output budget. This is what lets a
+    whole source file come back in one call while still bounding list/grep/command
+    output separately.
+    """
+    if profile_for(path) == "code":
+        return MAX_READ_OUTPUT
+    return max_output
+
+
 def _render_window(body: str, limit: int, first_line: int, total_lines: int,
                    path: str | None = None) -> str:
-    """Clip a line-addressed window, reporting position against the FILE."""
+    """Clip a line-addressed window, reporting position against the FILE.
+
+    The footer is honest about *why* material was withheld and how to get it.
+    A caller that asked for the whole file and received a partial one is told to
+    raise the budget; a caller that paged is told the next offset. Reporting a
+    bare "more follows" is what let a caller conclude a hard limit existed.
+    """
     body = redact_secrets(body, path)
     lines = body.splitlines(keepends=True)
     last_shown = first_line + len(lines) - 1 if lines else first_line
 
+    truncated_chars = 0
     if len(body) > limit:
         kept: list[str] = []
         used = 0
@@ -71,11 +103,17 @@ def _render_window(body: str, limit: int, first_line: int, total_lines: int,
             )
         body = "".join(kept)
         last_shown = first_line + len(kept) - 1
+        truncated_chars = len(redact_secrets("".join(lines), path)) - len(body)
 
     last_shown = max(last_shown, first_line)
     footer = f"[lines {first_line}-{last_shown} of {total_lines} total]"
     if last_shown < total_lines:
         footer += f" [more follows; call read_file with offset={last_shown}]"
+    if truncated_chars > 0:
+        footer += (
+            f" [char budget reached with {total_lines - last_shown} lines "
+            f"remaining; raise MAX_READ_OUTPUT to return more in one call]"
+        )
     return f"{body}\n{footer}"
 
 
@@ -109,7 +147,6 @@ def _code_hint(path: str, glob: str | None = None) -> bool | None:
     default rather than guessing, so an unknown mix is never relaxed.
     """
     if glob and "." in glob:
-        from access import profile_for
         return profile_for(glob) == "code"
     return None
 
@@ -120,7 +157,7 @@ def definitions() -> list[dict[str, Any]]:
         {"type": "function", "function": {"name": "list_files", "description": "List files/directories in an allowed workspace path. Sensitive filenames may be visible but their contents cannot be read.", "parameters": {"type": "object", "properties": {"path": {"type": "string"}, "max_depth": {"type": "integer", "minimum": 1, "maximum": 8}}, "required": ["path"], "additionalProperties": False}}},
         {"type": "function", "function": {"name": "grep", "description": "Search file contents with ripgrep and return matching lines with numbers. PREFER THIS over read_file to locate a symbol, function, or string: it returns the ~20 relevant lines instead of whole files.", "parameters": {"type": "object", "properties": {"pattern": {"type": "string", "description": "Regex to search for"}, "path": {"type": "string", "description": "File or directory to search; defaults to /workspace/write"}, "glob": {"type": "string", "description": "Optional file glob, e.g. '*.py'"}, "ignore_case": {"type": "boolean"}}, "required": ["pattern"], "additionalProperties": False}}},
         {"type": "function", "function": {"name": "outline", "description": "Structural outline of a source file (classes, functions, methods with line numbers) without reading the bodies. Use to decide which lines to read. Python is parsed via AST; other languages fall back to a definition-pattern scan.", "parameters": {"type": "object", "properties": {"path": {"type": "string"}}, "required": ["path"], "additionalProperties": False}}},
-        {"type": "function", "function": {"name": "read_file", "description": "Read a text file from writable or read-only workspace roots. Small files are returned whole. Large files return a line window starting at `offset` (0-based) and report exactly which lines were shown against the file's true length, so paging is reliable. Known secret files are blocked. Source-code files are returned verbatim; other files have embedded secrets redacted.", "parameters": {"type": "object", "properties": {"path": {"type": "string"}, "offset": {"type": "integer", "minimum": 0, "description": "0-based first line to return. Default 0."}, "limit": {"type": "integer", "minimum": 0, "description": "Max lines to return. Default 500. Use 0 to request the whole file (still capped by the server)."}}, "required": ["path"], "additionalProperties": False}}},
+        {"type": "function", "function": {"name": "read_file", "description": "Read a text file from writable or read-only workspace roots. Small files are returned whole; any source-code file is returned whole in one call if it fits the read budget. Large files return a line window starting at `offset` (0-based) and the footer states exactly which lines were shown against the file's true length. Use limit=0 (or a large limit) to request as much as the budget allows. Known secret files are blocked; source-code files are returned verbatim, other files have embedded secrets redacted.", "parameters": {"type": "object", "properties": {"path": {"type": "string"}, "offset": {"type": "integer", "minimum": 0, "description": "0-based first line to return. Default 0."}, "limit": {"type": "integer", "minimum": 0, "description": "Max lines to return. Default 500. Use 0 for as many as the budget allows."}}, "required": ["path"], "additionalProperties": False}}},
         {"type": "function", "function": {"name": "write_file", "description": "Create or replace a text file. Only /workspace/write is writable. For files larger than a few thousand tokens, write in chunks: create the file with the first chunk, then append further chunks with run_command (e.g. cat >> path <<'EOF'), because a single oversized call can exceed the output token limit and be rejected.", "parameters": {"type": "object", "properties": {"path": {"type": "string"}, "content": {"type": "string"}}, "required": ["path", "content"], "additionalProperties": False}}},
         {"type": "function", "function": {"name": "apply_patch", "description": "Apply a unified diff to a writable root. The patch must target paths beneath /workspace/write.", "parameters": {"type": "object", "properties": {"patch": {"type": "string"}}, "required": ["patch"], "additionalProperties": False}}},
         {"type": "function", "function": {"name": "run_command", "description": "Run a shell command with /workspace/write as the working area. Only allowlisted programs may be invoked (SAFE_COMMANDS); reads of /workspace/read are rejected. Returns JSON {exit_code, stdout, stderr}.", "parameters": {"type": "object", "properties": {"command": {"type": "string"}, "timeout": {"type": "integer", "minimum": 1, "maximum": 600}}, "required": ["command"], "additionalProperties": False}}},
@@ -305,10 +342,15 @@ def sandbox_handlers(workspace: DockerWorkspace, max_output: int) -> dict[str, C
 
         start = max(int(offset), 0)
         want = int(limit)
+        remaining = max(total_lines - start, 0) or MAX_READ_LINES
+
+        # `limit<=0` means "as much as the budget allows". A file that fits
+        # WHOLE_FILE_LINES is also returned whole without an explicit limit, so
+        # the common case needs no special call. Either way the cap is
+        # MAX_READ_LINES lines, and _render_window enforces the character budget.
         if want <= 0 or (total_lines and total_lines <= WHOLE_FILE_LINES and start == 0):
-            end = start + min(total_lines or MAX_READ_LINES, MAX_READ_LINES)
-        else:
-            end = start + min(want, MAX_READ_LINES)
+            want = remaining
+        end = start + min(want, MAX_READ_LINES, remaining)
 
         cmd = f"sed -n {start + 1},{end}p -- {quoted}"
         r = workspace.execute(cmd)
@@ -317,7 +359,8 @@ def sandbox_handlers(workspace: DockerWorkspace, max_output: int) -> dict[str, C
 
         body = str(r["stdout"]).strip("\n")
         assert_no_secrets(body, path)
-        return _render_window(body, max_output, start + 1, total_lines, path)
+        budget = _read_budget(path, max_output)
+        return _render_window(body, budget, start + 1, total_lines, path)
 
     def write_file(path: str, content: str) -> str:
         POLICY.assert_write(path)
