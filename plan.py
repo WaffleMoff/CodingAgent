@@ -3,7 +3,14 @@
 Claude Code ships `TodoWrite`; Cursor ships Plan mode. Both let the model keep a
 structured task list outside its context window so a long run does not lose the
 thread. This is the local equivalent: one tool, `manage_plan`, that reads and
-writes a small JSON plan file in the app directory.
+writes a small JSON plan file.
+
+Plans are SESSION-SCOPED. Each session owns its own file under
+`<app>/.agent/plans/<session_id>.json`, so one session's plan can never be read
+back into another session. This is the fix for a real failure: a leftover plan in
+a single global file was re-injected into an unrelated session by compaction's
+state re-injection (`compaction.fidelity_messages`), making the agent believe it
+was working on a task it had never been given.
 
 It is a PLANNING aid, not a gate. It records steps and their status; whether an
 unfinished plan blocks the final answer is a separate decision made by the
@@ -16,27 +23,53 @@ from __future__ import annotations
 
 import json
 import os
+import re
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
 STATUS_MARK = {"todo": " ", "doing": "~", "done": "x"}
 
+_SESSION_RE = re.compile(r"[^A-Za-z0-9_.-]+")
 
-def default_plan_path() -> str:
+
+def _sanitize(session_id: str) -> str:
+    """Filesystem-safe session id. Empty or junk collapses to 'default'."""
+    cleaned = _SESSION_RE.sub("_", (session_id or "").strip())
+    return cleaned or "default"
+
+
+def plan_path(session_id: str = "default") -> str:
+    """Resolve the plan file for `session_id`.
+
+    AGENT_PLAN_PATH, if set, is treated as a directory for per-session files so a
+    single override still gives each session its own plan. A bare ``.json`` value
+    is honoured verbatim, which preserves a fixed single-file override for
+    tests/scripts. Without the env var, plans live in `<app>/.agent/plans/`.
+    """
     env = os.getenv("AGENT_PLAN_PATH", "").strip()
     if env:
-        return env
-    return str(Path(__file__).resolve().parent / ".agent" / "PLAN.json")
+        p = Path(env)
+        return str(p) if p.suffix == ".json" else str(p / f"{_sanitize(session_id)}.json")
+    return str(Path(__file__).resolve().parent / ".agent" / "plans" / f"{_sanitize(session_id)}.json")
+
+
+def default_plan_path(session_id: str = "default") -> str:
+    return plan_path(session_id)
 
 
 @dataclass
 class Plan:
     path: str
+    session_id: str = "default"
     task: str = ""
     steps: list[dict[str, Any]] = field(default_factory=list)
     notes: list[str] = field(default_factory=list)
     _next_id: int = 1
+
+    @classmethod
+    def for_session(cls, session_id: str) -> "Plan":
+        return cls(path=plan_path(session_id), session_id=_sanitize(session_id))
 
     def add(self, text: str) -> dict[str, Any]:
         step = {"id": self._next_id, "text": text.strip(), "status": "todo", "note": ""}
@@ -61,7 +94,10 @@ class Plan:
         p = Path(self.path)
         p.parent.mkdir(parents=True, exist_ok=True)
         p.write_text(json.dumps({
-            "task": self.task, "steps": self.steps, "notes": self.notes,
+            "session_id": self.session_id,
+            "task": self.task,
+            "steps": self.steps,
+            "notes": self.notes,
             "next_id": self._next_id,
         }, indent=2), encoding="utf-8")
 

@@ -51,10 +51,13 @@ FINISH_GATE_ENABLED = os.getenv("FINISH_GATE_ENABLED", "on").strip().lower() != 
 FINISH_RETRIES = int(os.getenv("FINISH_RETRIES", "3"))
 
 # --- plan tool --------------------------------------------------------------
-# Where manage_plan persists its JSON. Defaults to <app>/.agent/PLAN.json.
-AGENT_PLAN_PATH = os.getenv(
-    "AGENT_PLAN_PATH", str(APP_DIR / ".agent" / "PLAN.json")
-)
+# Plans are SESSION-SCOPED: manage_plan writes
+# <app>/.agent/plans/<session_id>.json, so compaction's state re-injection can
+# never hand one session another session's plan. Leave AGENT_PLAN_PATH unset for
+# that default; set it only to redirect the plan *directory*. A bare ".json"
+# value still forces a single shared file, which re-introduces cross-session
+# leakage and is intended for tests/scripts only.
+AGENT_PLAN_PATH = os.getenv("AGENT_PLAN_PATH", "").strip()
 
 # --- web server / sandbox ---------------------------------------------------
 IMAGE = os.getenv("AGENT_IMAGE", "python:3.12-slim")

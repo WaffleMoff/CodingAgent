@@ -1,3 +1,21 @@
+"""Local coding-agent web app: Flask + SSE dashboard over the agent loop.
+
+This module owns HTTP and session plumbing only. All harness behaviour (planning,
+compaction, verification, permissions) is wired in one place — `hooks_wiring.
+default_hooks()` — and the loop itself is in `agent.py`. Nothing in the request
+handlers knows which hook implements which event.
+
+Two call sites changed for the harness:
+
+1. `_new_session` binds a session id into the hook set. `default_hooks(
+   session_id=sid)` scopes compaction's state re-injection and the writes log to
+   this session, so a session can never re-read another session's plan or writes.
+   This is the fix for a stale plan leaking across sessions after compaction.
+
+2. The posts get a 'compaction' progress event for free (the loop emits it) and
+   the tool log surfaces hook blocks; both are rendered by `renderLive`.
+"""
+
 from __future__ import annotations
 
 import atexit
@@ -101,7 +119,9 @@ def _new_session() -> str:
     with _lock:
         _bridges.append(bridge)
 
-    hooks = default_hooks(gate=gate)
+    # Bind the session id so compaction's fidelity hook and the writes log only
+    # ever see this session's state.
+    hooks = default_hooks(gate=gate, session_id=sid)
 
     sess["agent"] = Agent(
         tools, handlers, callback, MAX_ITERATIONS,

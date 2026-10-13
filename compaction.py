@@ -1,4 +1,4 @@
-"""Context compaction with state fidelity.
+"""Context compaction with session-scoped state fidelity.
 
 Compaction replaces the middle of the history with a summary. The failure mode
 is not the summary being wrong — it is the agent forgetting state that lived
@@ -7,14 +7,16 @@ written, where the repo stood, and which files it had been touching. A modern
 agent re-injects that state from disk after compaction, because disk is the
 source of truth and survives any context loss.
 
-So `compact` does two things: summarize the middle, then fire the
-`post_compact` hooks, whose job is to re-inject durable state. The default set
-(`fidelity_messages`) reads from disk, not from the summary:
+The state that gets re-injected MUST belong to the session being compacted. A
+global plan file re-injected into a different session is how an agent came to
+believe it was working on an unrelated task (a stale plan from a prior session,
+read verbatim into a fresh one). So `fidelity_messages` is bound to a
+`session_id` and every source it reads is filtered by that id:
 
-  - the plan file (PLAN.json) if one exists,
-  - a log of files written this session,
-  - `git status --short` in the write root, if it is a repo,
-  - the most recently modified files in the write root.
+  - the session's own plan file (.agent/plans/<session_id>.json),
+  - the writes log entries tagged with this session,
+  - the most recently modified files, which are only names — safe to show, but
+    shown as a hint rather than as the session's own work.
 
 Re-injection is best-effort: any source that is missing or errors is skipped, so
 compaction can never fail *because* state could not be reloaded. That keeps the
@@ -25,18 +27,17 @@ from __future__ import annotations
 
 import json
 import os
-import subprocess
 import time
 from pathlib import Path
 from typing import Any
 
 from config import (
-    AGENT_PLAN_PATH,
     COMPACT_AT_TOKENS,
     COMPACT_ENABLED,
     COMPACT_KEEP_RECENT,
     COMPACT_MAX_SUMMARY_TOKENS,
 )
+from plan import plan_path
 
 SUMMARY_PREFIX = "[SUMMARY OF EARLIER CONVERSATION]"
 FIDELITY_PREFIX = "[STATE RE-INJECTED AFTER COMPACTION]"
@@ -44,7 +45,8 @@ FIDELITY_PREFIX = "[STATE RE-INJECTED AFTER COMPACTION]"
 WRITE_ROOT = Path(os.getenv("AGENT_WRITE_ROOT", "/workspace/write"))
 
 # Running log of files written this session; appended by the post_tool_use hook
-# in hooks_wiring.py, read back here.
+# in hooks_wiring.py, read back here. Lines are prefixed with the session id so
+# a later session only sees its own writes.
 WRITES_LOG = Path(os.getenv("AGENT_WRITES_LOG", "/tmp/agent_writes.log"))
 
 _SUMMARY_INSTRUCTION = (
@@ -109,11 +111,14 @@ def _summarize(llm: Any, block: list[dict[str, Any]]) -> str | None:
 
 # --- fidelity: re-inject durable state from disk --------------------------
 
-def _plan_state() -> str:
+def _plan_state(session_id: str) -> str:
     try:
-        raw = Path(AGENT_PLAN_PATH).read_text(encoding="utf-8")
+        raw = Path(plan_path(session_id)).read_text(encoding="utf-8")
         data = json.loads(raw)
     except Exception:
+        return ""
+    # Defensive: a plan written by another session must never be re-injected.
+    if str(data.get("session_id") or "") != session_id:
         return ""
     task = str(data.get("task") or "").strip()
     steps = data.get("steps") or []
@@ -131,12 +136,13 @@ def _plan_state() -> str:
     return "\n".join(lines)
 
 
-def _writes_log(limit: int = 20) -> str:
+def _writes_log(session_id: str, limit: int = 20) -> str:
     try:
         lines = WRITES_LOG.read_text(encoding="utf-8").splitlines()
     except Exception:
         return ""
-    recent = [l for l in lines if l.strip()][-limit:]
+    own = [l for l in lines if l.strip() and l.split(" ", 1)[0] == session_id]
+    recent = own[-limit:]
     if not recent:
         return ""
     return "FILES WRITTEN THIS SESSION (most recent last):\n" + "\n".join(f"  {l}" for l in recent)
@@ -146,6 +152,7 @@ def _git_status() -> str:
     try:
         if not (WRITE_ROOT / ".git").exists():
             return ""
+        import subprocess
         out = subprocess.run(
             ["git", "status", "--short"], cwd=str(WRITE_ROOT),
             capture_output=True, text=True, timeout=5,
@@ -173,7 +180,7 @@ def _recent_files(limit: int = 12) -> str:
         recent = entries[:limit]
         if not recent:
             return ""
-        lines = ["RECENTLY MODIFIED FILES:"]
+        lines = ["RECENTLY MODIFIED FILES (any session):"]
         for mtime, p in recent:
             rel = p.relative_to(WRITE_ROOT)
             lines.append(f"  {rel}  ({time.strftime('%Y-%m-%d %H:%M', time.localtime(mtime))})")
@@ -182,13 +189,36 @@ def _recent_files(limit: int = 12) -> str:
         return ""
 
 
+def make_fidelity_hook(session_id: str):
+    """Return a post_compact hook bound to `session_id`.
+
+    The hook renders only this session's plan and writes; the recent-files list
+    is labelled as workspace-wide so it is not mistaken for the session's work.
+    """
+    def fidelity_messages(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        parts = [
+            p for p in (
+                _plan_state(session_id),
+                _writes_log(session_id),
+                _git_status(),
+                _recent_files(),
+            ) if p
+        ]
+        if not parts:
+            return []
+        body = f"{FIDELITY_PREFIX}\nSESSION: {session_id}\n" + "\n\n".join(parts)
+        return [{"role": "system", "content": body}]
+
+    return fidelity_messages
+
+
 def fidelity_messages(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """Default post_compact hook: rebuild durable state from disk as one message."""
-    parts = [p for p in (_plan_state(), _writes_log(), _git_status(), _recent_files()) if p]
-    if not parts:
-        return []
-    body = FIDELITY_PREFIX + "\n" + "\n\n".join(parts)
-    return [{"role": "system", "content": body}]
+    """Default post_compact hook for callers with no session id.
+
+    Falls back to the 'default' session so nothing is re-injected from another
+    session's plan. Callers that own a session should use `make_fidelity_hook`.
+    """
+    return make_fidelity_hook("default")(messages)
 
 
 # --- compaction -----------------------------------------------------------
