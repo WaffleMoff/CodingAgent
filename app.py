@@ -14,6 +14,11 @@ Two call sites changed for the harness:
 
 2. The posts get a 'compaction' progress event for free (the loop emits it) and
    the tool log surfaces hook blocks; both are rendered by `renderLive`.
+
+Roots are grouped into named profiles (roots_profiles.ProfileStore). Applying a
+profile is just a normal root change: it goes through `_root_manager.apply`, so
+the same validation and the same container rebuild happen as when paths are
+saved by hand. Profiles store snapshots; they never bypass validation.
 """
 
 from __future__ import annotations
@@ -32,12 +37,14 @@ from config import (
     APP_DIR, HOST, IMAGE, MAX_HISTORY, MAX_ITERATIONS, MAX_TOOL_OUTPUT, PORT,
 )
 from hooks_wiring import default_hooks
+from roots_profiles import ProfileError, ProfileStore
 from sandbox import RootManager
 from tools import build_registry
 
 app = Flask(__name__)
 _lock = threading.RLock()
 _root_manager: RootManager | None = None
+_profile_store: ProfileStore | None = None
 _sessions: dict[str, dict[str, Any]] = {}
 _bridges: list[Any] = []
 
@@ -198,6 +205,90 @@ def validate_roots_endpoint():
     except RootsConfigError as exc:
         return jsonify({"ok": False, "error": str(exc)})
     return jsonify({"ok": True})
+
+
+# --- root profiles ---------------------------------------------------------
+#
+# A profile is a named snapshot of a {writable, readonly} path set. It is
+# stored as JSON and is purely a convenience: applying one routes through the
+# same /api/roots machinery, so validation and rebuild behaviour are identical
+# to a manual save. Profiles cannot smuggle in an invalid root set.
+
+@app.get("/api/roots/profiles")
+def list_profiles():
+    if _profile_store is None:
+        return jsonify({"error": "Profile store is not initialised"}), 503
+    return jsonify({
+        "profiles": [p.to_json() for p in _profile_store.list()],
+        "active": _root_manager.config().to_json() if _root_manager else None,
+    })
+
+
+@app.post("/api/roots/profiles")
+def save_profile():
+    """Create or overwrite a profile. Body: {name, writable[], readonly[]}.
+
+    The proposed paths are validated first, so a profile can never be saved
+    that would fail on apply. Nothing is rebuilt here.
+    """
+    from sandbox import RootsConfigError, build_config
+
+    if _profile_store is None:
+        return jsonify({"error": "Profile store is not initialised"}), 503
+
+    payload = request.get_json() or {}
+    name = (payload.get("name") or "").strip()
+    writable = list(payload.get("writable") or [])
+    readonly = list(payload.get("readonly") or [])
+
+    try:
+        build_config(writable, readonly)
+    except RootsConfigError as exc:
+        return jsonify({"error": f"Invalid roots: {exc}"}), 400
+
+    try:
+        profile = _profile_store.save(name, writable, readonly)
+    except ProfileError as exc:
+        return jsonify({"error": str(exc)}), 400
+    return jsonify({"profile": profile.to_json(),
+                    "profiles": [p.to_json() for p in _profile_store.list()]})
+
+
+@app.delete("/api/roots/profiles/<name>")
+def delete_profile(name: str):
+    if _profile_store is None:
+        return jsonify({"error": "Profile store is not initialised"}), 503
+    try:
+        _profile_store.delete(name)
+    except ProfileError as exc:
+        return jsonify({"error": str(exc)}), 404
+    return jsonify({"profiles": [p.to_json() for p in _profile_store.list()]})
+
+
+@app.post("/api/roots/profiles/apply")
+def apply_profile():
+    """Apply a saved profile: rebuild the sandbox with the profile's roots.
+
+    Body: {name}. This delegates to the same `apply()` used by a manual save.
+    """
+    if _root_manager is None or _profile_store is None:
+        return jsonify({"error": "Root manager is not initialised"}), 503
+
+    payload = request.get_json() or {}
+    name = (payload.get("name") or "").strip()
+    profile = _profile_store.get(name)
+    if profile is None:
+        return jsonify({"error": f"No such profile: {name}"}), 404
+
+    try:
+        updated = _root_manager.apply(list(profile.writable), list(profile.readonly))
+    except Exception as exc:
+        return jsonify({"error": str(exc)}), 400
+    return jsonify({
+        "roots": updated.to_json(),
+        "state": _root_manager.state,
+        "applied": profile.name,
+    })
 
 
 @app.route("/api/browse", methods=["GET"])
@@ -375,6 +466,17 @@ DASHBOARD = r"""
   #roots-error{color:#991b1b;background:#fee2e2;padding:8px 10px;border-radius:4px;
                margin-bottom:10px;display:none;white-space:pre-wrap}
   #roots-note{color:#475569;font-size:12px;margin-bottom:12px;line-height:1.5}
+  #profile-bar{display:flex;align-items:center;gap:8px;margin-bottom:14px;padding:10px;
+               border:1px solid #e2e8f0;border-radius:4px;background:#f8fafc;flex-wrap:wrap}
+  #profile-bar label{font-size:12px;color:#475569;font-weight:600}
+  #profile-select{min-width:220px;padding:6px 8px;border:1px solid #cbd5e1;border-radius:4px;
+                  font-size:12px;background:white}
+  #profile-bar button{padding:6px 12px;border:0;border-radius:4px;cursor:pointer;font-size:12px}
+  #profile-apply{background:#2563eb;color:white}
+  #profile-save{background:#0891b2;color:white}
+  #profile-new{background:#16a34a;color:white}
+  #profile-delete{background:#ef4444;color:white}
+  #profile-bar button:disabled{opacity:.45;cursor:not-allowed}
   .picker{border:1px solid #cbd5e1;border-radius:4px;margin-top:6px;max-height:240px;
           overflow-y:auto;display:none;background:white}
   .picker .row{padding:6px 10px;cursor:pointer;font-family:ui-monospace,Menlo,Consolas,monospace;
@@ -411,6 +513,16 @@ DASHBOARD = r"""
         A rebuild clears in-container state (installed packages, /tmp); files in writable
         roots are on the host and stay put.
       </div>
+
+      <div id="profile-bar">
+        <label for="profile-select">Profile</label>
+        <select id="profile-select"><option value="">(none)</option></select>
+        <button id="profile-apply">Apply &amp; rebuild</button>
+        <button id="profile-save">Save current as profile</button>
+        <button id="profile-new">Save as new&hellip;</button>
+        <button id="profile-delete">Delete</button>
+      </div>
+
       <div id="roots-error"></div>
 
       <div class="root-group">
@@ -461,6 +573,8 @@ let eventSource = null;
 let running = false;
 let draft = {writable: [], readonly: []};
 let pickerTarget = null;
+let profiles = [];
+let activeProfileName = '';
 
 document.querySelectorAll('.tab-btn').forEach(btn => {
   btn.onclick = () => {
@@ -599,6 +713,12 @@ function rootsError(msg){
   el.style.display = 'block'; el.textContent = msg;
 }
 
+function sameSet(a, b){
+  if (a.length !== b.length) return false;
+  const x = a.slice().sort(), y = b.slice().sort();
+  return x.every((v, i) => v === y[i]);
+}
+
 function renderRoots(){
   ['writable', 'readonly'].forEach(kind => {
     const container = document.getElementById('roots-' + kind);
@@ -622,6 +742,27 @@ function renderRoots(){
       container.appendChild(row);
     });
   });
+}
+
+function renderProfiles(){
+  const sel = document.getElementById('profile-select');
+  sel.innerHTML = '<option value="">(none)</option>';
+  profiles.forEach(p => {
+    const opt = document.createElement('option');
+    opt.value = p.name;
+    opt.textContent = p.name;
+    sel.appendChild(opt);
+  });
+  sel.value = profiles.some(p => p.name === activeProfileName) ? activeProfileName : '';
+  document.getElementById('profile-delete').disabled = !sel.value;
+}
+
+async function loadProfiles(){
+  const r = await fetch('/api/roots/profiles');
+  const d = await r.json();
+  if (!r.ok || d.error) { rootsError(d.error || 'failed to load profiles'); return; }
+  profiles = d.profiles || [];
+  renderProfiles();
 }
 
 async function loadRoots(){
@@ -665,6 +806,75 @@ async function saveRoots(){
   await loadRoots();
 }
 
+/* Load the selected profile's paths into the editable draft. This does NOT
+   rebuild anything: the operator can inspect or tweak, then apply. */
+function selectProfile(name){
+  activeProfileName = name;
+  const p = profiles.find(x => x.name === name);
+  if (p) {
+    draft.writable = p.writable.slice();
+    draft.readonly = p.readonly.slice();
+    renderRoots();
+  }
+  document.getElementById('profile-delete').disabled = !name;
+}
+
+async function applyProfile(){
+  const name = document.getElementById('profile-select').value;
+  const msg = document.getElementById('roots-msg');
+  if (!name) { rootsError('Select a profile first.'); return; }
+  msg.textContent = 'rebuilding...';
+  rootsError('');
+  const r = await fetch('/api/roots/profiles/apply', {
+    method: 'POST', headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({name}),
+  });
+  const d = await r.json();
+  if (!r.ok || d.error) { rootsError(d.error || 'failed to apply profile'); msg.textContent = ''; return; }
+  msg.textContent = 'applied ' + name;
+  setTimeout(() => { msg.textContent = ''; }, 2500);
+  await loadRoots();
+}
+
+async function saveCurrentAsProfile(){
+  const name = document.getElementById('profile-select').value;
+  if (!name) { saveAsNewProfile(); return; }
+  await putProfile(name, draft.writable, draft.readonly);
+}
+
+async function saveAsNewProfile(){
+  const name = (prompt('New profile name:') || '').trim();
+  if (!name) return;
+  await putProfile(name, draft.writable, draft.readonly);
+}
+
+async function putProfile(name, writable, readonly){
+  rootsError('');
+  const r = await fetch('/api/roots/profiles', {
+    method: 'POST', headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({name, writable, readonly}),
+  });
+  const d = await r.json();
+  if (!r.ok || d.error) { rootsError(d.error || 'failed to save profile'); return; }
+  profiles = d.profiles || [];
+  activeProfileName = name;
+  renderProfiles();
+  rootsError('');
+}
+
+async function deleteProfile(){
+  const name = document.getElementById('profile-select').value;
+  if (!name) return;
+  if (!confirm('Delete profile "' + name + '"?')) return;
+  rootsError('');
+  const r = await fetch('/api/roots/profiles/' + encodeURIComponent(name), {method: 'DELETE'});
+  const d = await r.json();
+  if (!r.ok || d.error) { rootsError(d.error || 'failed to delete profile'); return; }
+  profiles = d.profiles || [];
+  if (activeProfileName === name) activeProfileName = '';
+  renderProfiles();
+}
+
 async function pickerTo(path){
   const picker = document.getElementById('picker');
   const url = path ? '/api/browse?path=' + encodeURIComponent(path) : '/api/browse';
@@ -699,6 +909,11 @@ document.getElementById('new').onclick = createSession;
 sendBtn.onclick = send;
 cancelBtn.onclick = cancelRun;
 document.getElementById('roots-save').onclick = saveRoots;
+document.getElementById('profile-select').onchange = e => selectProfile(e.target.value);
+document.getElementById('profile-apply').onclick = applyProfile;
+document.getElementById('profile-save').onclick = saveCurrentAsProfile;
+document.getElementById('profile-new').onclick = saveAsNewProfile;
+document.getElementById('profile-delete').onclick = deleteProfile;
 document.querySelectorAll('[data-add]').forEach(btn => {
   btn.onclick = () => addRoot(btn.dataset.add);
 });
@@ -717,6 +932,7 @@ msgInput.addEventListener('keydown', e => {
   if (data.length) await selectSession(data[0].id);
   else await createSession();
   await loadRoots();
+  await loadProfiles();
   setInterval(loadSessions, 3000);
   setInterval(pollStatus, 2000);
 })();
@@ -727,7 +943,7 @@ msgInput.addEventListener('keydown', e => {
 
 
 def main() -> None:
-    global _root_manager
+    global _root_manager, _profile_store
     import os
     if not os.getenv("DEEPSEEK_API_KEY"):
         raise SystemExit("DEEPSEEK_API_KEY is required in .env")
@@ -744,6 +960,10 @@ def main() -> None:
     # Per-container state is stale after a rebuild: clear every Excel bridge's
     # install flag so the engine is re-shipped into the fresh container.
     _root_manager.on_rebuild(_invalidate_container_caches)
+
+    # Saved root profiles live beside the root files, in the app directory
+    # (which is writable by the host app and read-only inside the sandbox).
+    _profile_store = ProfileStore(APP_DIR / "roots_profiles.json")
 
     threading.Thread(target=_start_workspace, daemon=True).start()
     app.run(host=HOST, port=PORT, debug=False, threaded=True)
