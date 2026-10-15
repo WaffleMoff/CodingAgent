@@ -117,14 +117,24 @@ def run_agent(
         return cancel_event is not None and cancel_event.is_set()
 
     def complete() -> Any:
-        """Single choke point: compact if due, inject the guard, call, strip."""
+        """Single choke point: compact if due, inject the guard, call, strip.
+
+        Compaction only runs at a TURN BOUNDARY - when the last message is not a
+        `tool` result. The model call that follows an assistant tool call must see
+        that call and its result together; rewriting the history there replaces
+        the in-flight exchange with a summary, which is how the agent came to
+        forget what it was doing mid-task. When the last message IS a tool result
+        we are between exchanges, and compaction is safe.
+        """
         if compact:
             from compaction import maybe_compact
-            try:
-                if maybe_compact(messages, llm, hooks=hooks):
-                    emit("compaction", {"messages": len(messages)})
-            except Exception as exc:
-                emit("error", {"message": f"Compaction failed: {exc}"})
+            at_turn_boundary = messages[-1].get("role") != "tool"
+            if at_turn_boundary:
+                try:
+                    if maybe_compact(messages, llm, hooks=hooks):
+                        emit("compaction", {"messages": len(messages)})
+                except Exception as exc:
+                    emit("error", {"message": f"Compaction failed: {exc}"})
         strip_guards(messages)
         guard = guard_message()
         if guard is not None:
