@@ -37,7 +37,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import xlsx  # noqa: E402  (co-located module)
 
 FORMAT_ALIASES = {
-    "text": "@",
+    "text": "General",
     "general": "General",
     "int": "#,##0",
     "integer": "#,##0",
@@ -70,11 +70,14 @@ def resolve_format(code: str | None) -> str:
     return FORMAT_ALIASES.get(key.lower(), key)
 
 
-def coerce(value):
+def coerce(value, date_context: bool = False):
     """Turn tool-supplied scalars into workbook values.
 
     Strings that are unambiguously numbers become numbers, because an LLM will
     otherwise happily write "1,250" and silently destroy the column's type.
+    Date-shaped strings become real dates only when the target column is a date
+    column (`date_context`); elsewhere they stay strings, so a value like
+    "2026-10-15" in a text column is not silently turned into a serial number.
     Everything else is left alone.
     """
     if value is None or isinstance(value, (int, float, bool, _dt.date, _dt.datetime)):
@@ -84,17 +87,18 @@ def coerce(value):
     text = value.strip()
     if text == "":
         return None
-    iso = xlsx._DATE_RE.match(text)
-    if iso:
-        try:
-            if iso.group(4):
-                return _dt.datetime(
-                    int(iso.group(1)), int(iso.group(2)), int(iso.group(3)),
-                    int(iso.group(4)), int(iso.group(5)), int(iso.group(6) or 0),
-                )
-            return _dt.date(int(iso.group(1)), int(iso.group(2)), int(iso.group(3)))
-        except ValueError:
-            return value
+    if date_context:
+        iso = xlsx._DATE_RE.match(text)
+        if iso:
+            try:
+                if iso.group(4):
+                    return _dt.datetime(
+                        int(iso.group(1)), int(iso.group(2)), int(iso.group(3)),
+                        int(iso.group(4)), int(iso.group(5)), int(iso.group(6) or 0),
+                    )
+                return _dt.date(int(iso.group(1)), int(iso.group(2)), int(iso.group(3)))
+            except ValueError:
+                return value
     if text.endswith("%"):
         try:
             return float(text[:-1].replace(",", "")) / 100.0
@@ -157,7 +161,7 @@ def _row_width(row: list) -> int:
     return len(row)
 
 
-def _normalise_rows(rows) -> list[list]:
+def _normalise_rows(rows, date_columns: set[int] | None = None) -> list[list]:
     if rows is None:
         return []
     if isinstance(rows, str):
@@ -169,7 +173,11 @@ def _normalise_rows(rows) -> list[list]:
         if isinstance(row, dict):
             out.append(list(row.values()))
         elif isinstance(row, (list, tuple)):
-            out.append([coerce(cell) for cell in row])
+            dates = date_columns or set()
+            out.append([
+                coerce(cell, date_context=(col in dates))
+                for col, cell in enumerate(row)
+            ])
         else:
             raise ValueError(f"row {index} is not a list or object")
     return out
@@ -196,7 +204,10 @@ def op_create(request) -> dict:
                 sheet.append([str(key), coerce(value)])
         elif isinstance(extra, (list, tuple)) and len(extra) == 2:
             sheet.append([coerce(extra[0]), coerce(extra[1])])
-    sheet.append(["Created", _dt.date.today()], formats={1: "yyyy-mm-dd"})
+    sheet.append_row(
+        ["Created", _dt.date.today().isoformat()],
+        cell_formats={1: "yyyy-mm-dd"},
+    )
     sheet.set_widths({0: 24, 1: 48})
     sheet.freeze("A2")
     book.save(path)
@@ -226,9 +237,9 @@ def op_write(request) -> dict:
     if headers is not None and not isinstance(headers, list):
         headers = json.loads(headers)
 
-    body = _normalise_rows(request.get("rows"))
     columns = [str(h) for h in headers] if headers else None
     formats = parse_formats(request.get("formats"), columns)
+    body = _normalise_rows(request.get("rows"), _date_columns(formats))
 
     start_row = request.get("start_row")
     if start_row:

@@ -1,14 +1,34 @@
-"""Minimal, dependency-free XLSX reader/writer for the agent sandbox.
+"""Minimal OOXML (xlsx) reader/writer built on the standard library only.
 
 The sandbox runs with `--network none`, so openpyxl cannot be installed. This
 module speaks OOXML directly using only the standard library, which makes Excel
 support work in any image without a build step.
 
 It is deliberately narrow. It writes and reads rectangular sheets with typed
-cells and per-column number formats, which is everything the `excel_*` tools
-need. It is not a general Excel engine: no charts, no images, no pivot tables,
-no formula evaluation (formulas are stored; `read` reports the last cached
-value).
+cells, per-column number formats, and per-cell number-format overrides. That is
+everything the `excel_*` tools need. It is not a general Excel engine: no
+charts, no images, no pivot tables, no formula evaluation (formulas are stored;
+`read` reports the last cached value).
+
+Wire format
+-----------
+Strings are written inline (`t="inlineStr"`), not via a shared-string table.
+This matches the package shape produced by the known-good raw-OOXML writers in
+this project and avoids the failure mode where a reader cannot resolve
+`sharedStrings.xml` and renders every string cell blank while numeric cells
+still show. The reader still accepts `sharedStrings.xml` so files written by
+older versions of this module load unchanged.
+
+Formatting model
+----------------
+A column carries a default number format (`sheet.formats`). A single cell may
+override it (`sheet.cell_formats`), keyed by (row_index, col_index), both
+0-based. The effective format for a cell is the cell override if present, else
+the column default, else General. This is what lets a date live in one cell of
+a column that otherwise holds numbers, without painting the whole column.
+
+Text columns use General (`numFmtId=0`), never Excel's built-in Text format
+(`numFmtId=49`): a number written into a 49-formatted cell renders blank.
 
 Public API:
     create_book()                  -> Book
@@ -16,6 +36,7 @@ Public API:
     book.sheets                    -> list[Sheet]
     book.get(name) / book.ensure(name) / book.remove(name)
     sheet.append(cells, formats=..) / sheet.add_rows(rows, headers=..)
+    sheet.set_cell_format(row, col, code)
     book.save(path)
 
 Cell values may be str, int, float, bool, datetime.date, datetime.datetime,
@@ -65,6 +86,10 @@ BUILTIN_FORMATS = {
     40: "#,##0.00;[Red](#,##0.00)",
     49: "@",
 }
+
+# Formats that are never emitted as a custom <numFmt>. Text (@) is intentionally
+# excluded from use on write; see the module docstring.
+_SKIP_FORMAT_CODES = {"", "General", "@"}
 
 MAX_CELL_CHARS = 32767
 MAX_SHEET_CHARS = 31
@@ -138,7 +163,13 @@ def _is_date_format(fmt: str) -> bool:
 
 
 class Sheet:
-    """A rectangular sheet: rows of Python values plus per-column formats."""
+    """A rectangular sheet: rows of Python values plus number formats.
+
+    Formats are held at two levels: `formats` is the per-column default and
+    `cell_formats` is a per-cell override. Both are keyed 0-based. The
+    effective format for a cell is cell override, else column default, else
+    General.
+    """
 
     def __init__(self, name: str, book: "Book | None" = None):
         self.name = name
@@ -146,19 +177,46 @@ class Sheet:
         self.rows: list[list[object]] = []
         # Original cell text for formula cells, preserved on round-trip.
         self._formulas: dict[tuple[int, int], str] = {}
-        # column index -> number format code (0-based)
+        # column index -> number format code (0-based), the column default
         self.formats: dict[int, str] = {}
+        # (row_index, col_index) -> number format code, a per-cell override
+        self.cell_formats: dict[tuple[int, int], str] = {}
         self.widths: dict[int, float] = {}
         self.frozen: str | None = None
 
     # -- construction ----------------------------------------------------
     def append(self, cells: list[object], formats: dict[int, str] | None = None) -> int:
-        """Append one row. `formats` maps a 0-based column index to a format code."""
+        """Append one row. `formats` maps a 0-based column index to a format code.
+
+        The format is applied to the column (its default), matching historical
+        behaviour. Use `append_row` to set a format on this row only.
+        """
         row_index = len(self.rows)
         self.rows.append(list(cells))
         if formats:
             for col, code in formats.items():
                 self._set_format(col, code)
+        return row_index + 1
+
+    def append_row(
+        self,
+        cells: list[object],
+        cell_formats: dict[int, str] | None = None,
+        formats: dict[int, str] | None = None,
+    ) -> int:
+        """Append one row, setting per-cell formats for this row only.
+
+        `cell_formats` maps a 0-based column index to a format code applied to
+        this row's cell alone; the rest of the column is untouched. `formats`
+        still sets the column default if given.
+        """
+        row_index = len(self.rows)
+        self.rows.append(list(cells))
+        if formats:
+            for col, code in formats.items():
+                self._set_format(col, code)
+        for col, code in (cell_formats or {}).items():
+            self.set_cell_format(row_index, col, code)
         return row_index + 1
 
     def add_rows(
@@ -170,6 +228,7 @@ class Sheet:
         """Append `headers` (if any) then every row. Returns rows added.
 
         `formats` keys may be 0-based indices, column letters, or header names.
+        These are column defaults; see `set_cell_format` for a single cell.
         """
         added = 0
         if headers:
@@ -195,18 +254,35 @@ class Sheet:
         self.formats[col] = code
 
     def set_format(self, column: int | str, number_format: str) -> None:
-        """Set a column's number format. Accepts a 0-based index, 1-based int via
-        `set_format_at`, or a column letter. Ambiguity between 0-based and 1-based
-        integers is avoided by treating ints as 0-based here and exposing
-        `set_format_at` for 1-based callers."""
+        """Set a column's default number format. Accepts a 0-based index or a
+        column letter. Ambiguity between 0-based and 1-based integers is avoided
+        by treating ints as 0-based here and exposing `set_format_at` for 1-based
+        callers."""
         if isinstance(column, int):
             self._set_format(column, number_format)
         else:
             self._set_format(_col_index(str(column)), number_format)
 
     def set_format_at(self, column_1based: int, number_format: str) -> None:
-        """Set a column's format using a 1-based column number."""
+        """Set a column's default format using a 1-based column number."""
         self._set_format(int(column_1based) - 1, number_format)
+
+    def set_cell_format(self, row: int, col: int, number_format: str) -> None:
+        """Set a number format on a single cell, keyed 0-based (row, col).
+
+        This overrides the column default for that cell only; sibling cells in
+        the same column keep the column's format. Use this for a lone date in a
+        numeric column.
+        """
+        if not isinstance(row, int) or row < 0:
+            raise ExcelError(f"row index must be a non-negative int, got {row!r}")
+        if not isinstance(col, int) or col < 0:
+            raise ExcelError(f"column index must be a non-negative int, got {col!r}")
+        self.cell_formats[(row, col)] = number_format
+
+    def cell_format(self, row: int, col: int) -> str:
+        """Effective format code for a cell: override, else column default."""
+        return self.cell_formats.get((row, col), self.formats.get(col, "General"))
 
     def set_widths(self, widths: dict[int, float]) -> None:
         """widths: {0-based column index: width in characters}."""
@@ -259,8 +335,6 @@ class Book:
     def __init__(self):
         self.sheets: list[Sheet] = []
         self._custom_formats: dict[str, int] = {}
-        self._shared: dict[str, int] = {}
-        self._shared_refs = 0
 
     # -- sheet management ------------------------------------------------
     def names(self) -> list[str]:
@@ -303,6 +377,18 @@ class Book:
             self._custom_formats[code] = 164 + len(self._custom_formats)
         return self._custom_formats[code]
 
+    def _all_format_codes(self) -> list[str]:
+        """Every distinct format code used by a column default or a cell."""
+        codes: list[str] = ["General"]
+        for sheet in self.sheets:
+            for code in sheet.formats.values():
+                if code and code not in codes:
+                    codes.append(code)
+            for code in sheet.cell_formats.values():
+                if code and code not in codes:
+                    codes.append(code)
+        return codes
+
     def save(self, path: str) -> None:
         if not self.sheets:
             raise ExcelError("workbook has no sheets")
@@ -312,12 +398,11 @@ class Book:
         target = os.path.abspath(path)
         os.makedirs(os.path.dirname(target) or ".", exist_ok=True)
 
-        # Detect formats before writing so the style table is complete.
-        used_formats: list[str] = []
-        for sheet in self.sheets:
-            for code in sheet.formats.values():
-                if code and code not in BUILTIN_FORMATS.values() and code not in used_formats:
-                    used_formats.append(code)
+        # Register custom formats before writing so the style table is complete.
+        used_formats = [
+            code for code in self._all_format_codes()
+            if code not in BUILTIN_FORMATS.values() and code not in _SKIP_FORMAT_CODES
+        ]
         self._custom_formats = {code: 164 + i for i, code in enumerate(used_formats)}
 
         tmp_dir = tempfile.mkdtemp(prefix="xlsx-")
@@ -340,35 +425,13 @@ class Book:
             with open(full, "w", encoding="utf-8") as fh:
                 fh.write(text)
 
-        # Collect the shared-string table first, then render every part from it.
-        # The table must be complete before any sheet XML is emitted.
-        self._shared = {}
-        self._shared_refs = 0
-        for sheet in self.sheets:
-            for sheet_row in sheet.rows:
-                for cell in sheet_row:
-                    if isinstance(cell, str) and cell:
-                        self._shared_index(cell[:MAX_CELL_CHARS])
-
         write("[Content_Types].xml", self._content_types())
         write("_rels/.rels", self._root_rels())
         write("xl/workbook.xml", self._workbook_xml())
         write("xl/_rels/workbook.xml.rels", self._workbook_rels())
         write("xl/styles.xml", self._styles_xml())
-        write("xl/sharedStrings.xml", self._shared_strings_xml())
         for i, sheet in enumerate(self.sheets, start=1):
             write(f"xl/worksheets/sheet{i}.xml", self._sheet_xml(sheet))
-
-    def _shared_strings_xml(self) -> str:
-        items = "".join(
-            f"<si><t xml:space=\"preserve\">{escape(text)}</t></si>"
-            for text, _ in sorted(self._shared.items(), key=lambda kv: kv[1])
-        )
-        return (
-            '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
-            f'<sst xmlns="{NS_MAIN}" count="{self._shared_refs}" '
-            f'uniqueCount="{len(self._shared)}">{items}</sst>'
-        )
 
     def _content_types(self) -> str:
         sheets = "".join(
@@ -384,7 +447,6 @@ class Book:
             '<Default Extension="xml" ContentType="application/xml"/>'
             '<Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/>'
             '<Override PartName="/xl/styles.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.styles+xml"/>'
-            '<Override PartName="/xl/sharedStrings.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sharedStrings+xml"/>'
             f"{sheets}"
             "</Types>"
         )
@@ -428,7 +490,12 @@ class Book:
         )
 
     def _styles_xml(self) -> str:
-        """Style ids: one cellXf per (role, number format), see _cell_styles()."""
+        """Style ids: one cellXf per (role, number format), see _cell_styles().
+
+        Shape matches the known-good raw-OOXML writer: cellStyleXfs and
+        cellStyles are present, borders contains only the default border, and
+        every cellXf carries xfId="0".
+        """
         fonts = (
             '<font><sz val="11"/><name val="Calibri"/></font>'
             '<font><b/><sz val="11"/><color rgb="FFFFFFFF"/><name val="Calibri"/></font>'
@@ -439,38 +506,40 @@ class Book:
             '<fill><patternFill patternType="solid"><fgColor rgb="FF1F3864"/>'
             '<bgColor indexed="64"/></patternFill></fill>'
         )
-        borders = (
-            '<border><left/><right/><top/><bottom/><diagonal/></border>'
-            '<border><left/><right/><top/>'
-            '<bottom style="thin"><color rgb="FFBFBFBF"/></bottom><diagonal/></border>'
-        )
+        borders = '<border><left/><right/><top/><bottom/><diagonal/></border>'
         xfs = []
         for role, code in self._cell_styles():
             fmt = self._format_id(code)
             if role == "header":
                 xfs.append(
-                    f'<xf numFmtId="{fmt}" fontId="1" fillId="2" borderId="1" '
-                    'applyFont="1" applyFill="1" applyBorder="1" applyNumberFormat="1" '
+                    f'<xf numFmtId="{fmt}" fontId="1" fillId="2" borderId="0" xfId="0" '
+                    'applyFont="1" applyFill="1" applyNumberFormat="1" '
                     'applyAlignment="1"><alignment horizontal="center" '
                     'vertical="center"/></xf>'
                 )
             else:
                 xfs.append(
-                    f'<xf numFmtId="{fmt}" fontId="0" fillId="0" borderId="0" '
+                    f'<xf numFmtId="{fmt}" fontId="0" fillId="0" borderId="0" xfId="0" '
                     'applyNumberFormat="1"/>'
                 )
         custom = "".join(
             f'<numFmt numFmtId="{fid}" formatCode={quoteattr(code)}/>'
             for code, fid in sorted(self._custom_formats.items(), key=lambda kv: kv[1])
         )
+        num_fmts = (
+            f'<numFmts count="{len(self._custom_formats)}">{custom}</numFmts>'
+            if self._custom_formats else ""
+        )
         return (
             '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
             f'<styleSheet xmlns="{NS_MAIN}">'
-            f'<numFmts count="{len(self._custom_formats)}">{custom}</numFmts>'
+            f"{num_fmts}"
             f'<fonts count="2">{fonts}</fonts>'
             f'<fills count="3">{fills}</fills>'
-            f'<borders count="2">{borders}</borders>'
+            f'<borders count="1">{borders}</borders>'
+            '<cellStyleXfs count="1"><xf numFmtId="0" fontId="0" fillId="0" borderId="0"/></cellStyleXfs>'
             f'<cellXfs count="{len(xfs)}">{"".join(xfs)}</cellXfs>'
+            '<cellStyles count="1"><cellStyle name="Normal" xfId="0" builtinId="0"/></cellStyles>'
             "</styleSheet>"
         )
 
@@ -484,12 +553,7 @@ class Book:
         """
         styles: list[tuple[str, str]] = []
         seen: set[tuple[str, str]] = set()
-        codes: list[str] = ["General"]
-        for sheet in self.sheets:
-            for code in sheet.formats.values():
-                if code and code not in codes:
-                    codes.append(code)
-        for code in codes:
+        for code in self._all_format_codes():
             for role in ("body", "header"):
                 pair = (role, code)
                 if pair not in seen:
@@ -533,7 +597,7 @@ class Book:
 
     def _cell_xml(self, row, col, value, sheet, lookup, has_header) -> str:
         ref = _coord(row, col)
-        code = sheet.formats.get(col, "General")
+        code = sheet.cell_format(row - 1, col)
         kind = "header" if (has_header and row == 1) else "body"
         style = lookup.get((kind, code))
         if style is None:
@@ -553,8 +617,11 @@ class Book:
             return f'<c r="{ref}" s="{style}"><v>{text}</v></c>'
         if isinstance(value, (_dt.datetime, _dt.date)):
             return f'<c r="{ref}" s="{style}"><v>{_serial(value)}</v></c>'
-        index = self._shared_index(str(value)[:MAX_CELL_CHARS])
-        return f'<c r="{ref}" s="{style}" t="s"><v>{index}</v></c>'
+        text = str(value)[:MAX_CELL_CHARS]
+        return (
+            f'<c r="{ref}" s="{style}" t="inlineStr">'
+            f'<is><t xml:space="preserve">{escape(text)}</t></is></c>'
+        )
 
     def _cached_formula_value(self, value) -> str:
         """Formulas need a cached result or Excel shows a blank until recalculation."""
@@ -567,12 +634,6 @@ class Book:
         if isinstance(value, (_dt.datetime, _dt.date)):
             return f"<v>{_serial(value)}</v>"
         return f"<v>{escape(str(value))}</v>"
-
-    def _shared_index(self, text: str) -> int:
-        self._shared_refs += 1
-        if text not in self._shared:
-            self._shared[text] = len(self._shared)
-        return self._shared[text]
 
 
 # ---------------------------------------------------------------- reading
@@ -693,13 +754,6 @@ def _read_sheet(xml: str, name: str, styles: list[str], shared: list[str]) -> Sh
             formula = re.search(r"<f[^>]*>(.*?)</f>", body, re.DOTALL)
             if formula:
                 sheet._formulas[(len(sheet.rows), col)] = _unescape(formula.group(1))
-            # Formats are a per-column property. Record the first non-General
-            # format seen, preferring data rows over the styled header row.
-            if fmt != "General":
-                if is_header_row:
-                    header_formats.setdefault(col, fmt)
-                elif col not in seen_formats:
-                    seen_formats[col] = fmt
             if ctype == "s":
                 idx_match = re.search(r"<v>(.*?)</v>", body, re.DOTALL)
                 idx = int(idx_match.group(1)) if idx_match else -1
@@ -727,7 +781,29 @@ def _read_sheet(xml: str, name: str, styles: list[str], shared: list[str]) -> Sh
                         else:
                             value = int(number) if number.is_integer() else number
             values.append(value)
+            # Reconstruct formatting: a non-General format on this cell is
+            # recorded as a cell override for every row except the header, and
+            # the column default is the first non-General format seen on a
+            # header cell (the column's own declaration).
+            if fmt != "General":
+                if is_header_row:
+                    header_formats.setdefault(col, fmt)
+                else:
+                    sheet.cell_formats[(len(sheet.rows), col)] = fmt
+                    seen_formats.setdefault(col, fmt)
         sheet.rows.append(values)
+    # Collapse per-cell overrides that are uniform across the column back into a
+    # column default, so a plainly column-formatted sheet round-trips as such
+    # rather than as hundreds of identical overrides.
+    from collections import defaultdict
+    per_col: dict[int, list[str]] = defaultdict(list)
+    for (row, col), fmt in sheet.cell_formats.items():
+        per_col[col].append(fmt)
+    for col, fmts in per_col.items():
+        if len(fmts) == len([r for r in sheet.rows[1:] if col < len(r)]) and len(set(fmts)) == 1:
+            seen_formats.setdefault(col, fmts[0])
+            for row in range(1, len(sheet.rows)):
+                sheet.cell_formats.pop((row, col), None)
     # Widths, for round-tripping the layout we wrote.
     for col_match in re.finditer(r'<col[^>]*min="(\d+)"[^>]*width="([\d.]+)"', xml):
         sheet.widths[int(col_match.group(1)) - 1] = float(col_match.group(2))
@@ -748,12 +824,18 @@ def describe(sheet: Sheet, *, max_rows: int = 10) -> dict:
     column_formats = {
         _col_letter(col): fmt for col, fmt in sorted(sheet.formats.items()) if fmt != "General"
     }
+    cell_formats = {
+        f"{_col_letter(col)}{row + 1}": fmt
+        for (row, col), fmt in sorted(sheet.cell_formats.items())
+        if fmt != "General"
+    }
     return {
         "sheet": sheet.name,
         "rows": len(sheet.rows),
         "columns": max((len(r) for r in sheet.rows), default=0),
         "headers": [str(h) if h is not None else "" for h in sheet.header],
         "number_formats": column_formats,
+        "cell_number_formats": cell_formats,
         "preview": preview,
         "formulas": len(sheet._formulas),
     }
