@@ -1,0 +1,24 @@
+{
+  "version": 1,
+  "profiles": [
+    {
+      "name": "STEIN",
+      "writable": [
+        "/Users/erikely/Documents/WORKOUT"
+      ],
+      "readonly": [
+        "/Users/erikely/Documents/STEIN"
+      ]
+    },
+    {
+      "name": "AG",
+      "writable": [
+        "/Users/erikely/Documents/CODING_AGENT_OUTPUT"
+      ],
+      "readonly": [
+        "/Users/erikely/Documents/AspirationalGambling",
+        "/Users/erikely/Documents/Website"
+      ]
+    }
+  ]
+}

@@ -260,6 +260,7 @@ class Book:
         self.sheets: list[Sheet] = []
         self._custom_formats: dict[str, int] = {}
         self._shared: dict[str, int] = {}
+        self._shared_refs = 0
 
     # -- sheet management ------------------------------------------------
     def names(self) -> list[str]:
@@ -342,6 +343,7 @@ class Book:
         # Collect the shared-string table first, then render every part from it.
         # The table must be complete before any sheet XML is emitted.
         self._shared = {}
+        self._shared_refs = 0
         for sheet in self.sheets:
             for sheet_row in sheet.rows:
                 for cell in sheet_row:
@@ -364,7 +366,7 @@ class Book:
         )
         return (
             '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
-            f'<sst xmlns="{NS_MAIN}" count="{len(self._shared)}" '
+            f'<sst xmlns="{NS_MAIN}" count="{self._shared_refs}" '
             f'uniqueCount="{len(self._shared)}">{items}</sst>'
         )
 
@@ -567,6 +569,7 @@ class Book:
         return f"<v>{escape(str(value))}</v>"
 
     def _shared_index(self, text: str) -> int:
+        self._shared_refs += 1
         if text not in self._shared:
             self._shared[text] = len(self._shared)
         return self._shared[text]

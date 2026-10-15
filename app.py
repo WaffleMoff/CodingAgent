@@ -471,6 +471,8 @@ DASHBOARD = r"""
   #profile-bar label{font-size:12px;color:#475569;font-weight:600}
   #profile-select{min-width:220px;padding:6px 8px;border:1px solid #cbd5e1;border-radius:4px;
                   font-size:12px;background:white}
+  #profile-name{min-width:180px;padding:6px 8px;border:1px solid #cbd5e1;border-radius:4px;
+                font-size:12px;background:white;font-family:ui-monospace,Menlo,Consolas,monospace}
   #profile-bar button{padding:6px 12px;border:0;border-radius:4px;cursor:pointer;font-size:12px}
   #profile-apply{background:#2563eb;color:white}
   #profile-save{background:#0891b2;color:white}
@@ -515,7 +517,11 @@ DASHBOARD = r"""
       </div>
 
       <div id="profile-bar">
-        <label for="profile-select">Profile</label>
+        <label for="profile-name">Name</label>
+        <input id="profile-name" list="profile-names" placeholder="profile name"
+               autocomplete="off" spellcheck="false">
+        <datalist id="profile-names"></datalist>
+        <label for="profile-select">Saved</label>
         <select id="profile-select"><option value="">(none)</option></select>
         <button id="profile-apply">Apply &amp; rebuild</button>
         <button id="profile-save">Save current as profile</button>
@@ -754,6 +760,13 @@ function renderProfiles(){
     sel.appendChild(opt);
   });
   sel.value = profiles.some(p => p.name === activeProfileName) ? activeProfileName : '';
+  const dl = document.getElementById('profile-names');
+  dl.innerHTML = '';
+  profiles.forEach(p => {
+    const opt = document.createElement('option');
+    opt.value = p.name;
+    dl.appendChild(opt);
+  });
   document.getElementById('profile-delete').disabled = !sel.value;
 }
 
@@ -815,6 +828,7 @@ function selectProfile(name){
     draft.writable = p.writable.slice();
     draft.readonly = p.readonly.slice();
     renderRoots();
+    document.getElementById('profile-name').value = name;
   }
   document.getElementById('profile-delete').disabled = !name;
 }
@@ -836,16 +850,31 @@ async function applyProfile(){
   await loadRoots();
 }
 
+function currentProfileName(){
+  return (document.getElementById('profile-name').value || '').trim();
+}
+
+/* Save the current draft under the name shown in the name field. Saves over an
+   existing profile of that name, or creates it if new. */
 async function saveCurrentAsProfile(){
-  const name = document.getElementById('profile-select').value;
-  if (!name) { saveAsNewProfile(); return; }
+  const name = currentProfileName();
+  if (!name) {
+    rootsError('Enter a profile name first, then Save.');
+    document.getElementById('profile-name').focus();
+    return;
+  }
   await putProfile(name, draft.writable, draft.readonly);
 }
 
-async function saveAsNewProfile(){
-  const name = (prompt('New profile name:') || '').trim();
-  if (!name) return;
-  await putProfile(name, draft.writable, draft.readonly);
+/* Clear the name field so the operator can type a fresh name. */
+function saveAsNewProfile(){
+  const field = document.getElementById('profile-name');
+  if (profiles.some(p => p.name === currentProfileName())) {
+    field.value = '';
+    activeProfileName = '';
+    renderProfiles();
+  }
+  field.focus();
 }
 
 async function putProfile(name, writable, readonly){
@@ -859,7 +888,11 @@ async function putProfile(name, writable, readonly){
   profiles = d.profiles || [];
   activeProfileName = name;
   renderProfiles();
+  document.getElementById('profile-name').value = name;
   rootsError('');
+  const msg = document.getElementById('roots-msg');
+  msg.textContent = 'profile "' + name + '" saved';
+  setTimeout(() => { msg.textContent = ''; }, 2500);
 }
 
 async function deleteProfile(){
@@ -871,7 +904,10 @@ async function deleteProfile(){
   const d = await r.json();
   if (!r.ok || d.error) { rootsError(d.error || 'failed to delete profile'); return; }
   profiles = d.profiles || [];
-  if (activeProfileName === name) activeProfileName = '';
+  if (activeProfileName === name) {
+    activeProfileName = '';
+    if (currentProfileName() === name) document.getElementById('profile-name').value = '';
+  }
   renderProfiles();
 }
 
