@@ -39,6 +39,17 @@ REMOTE_DIR = "/tmp/.excel_engine"
 MAX_ROWS_PER_CALL = 20_000
 MAX_ROW_WIDTH = 512
 
+_ALIGNMENT_SPEC = {
+    "type": "object",
+    "description": (
+        "Per-column or default alignment. A {horizontal, vertical, wrap} object "
+        "applies to every column; a {column: spec} object applies per column, "
+        "where column is a header, letter, or 0-based index. Values default to "
+        "center/center. Example: {'Revenue': {'horizontal': 'right'}, "
+        "'horizontal': 'left'}."
+    ),
+}
+
 
 class ExcelToolError(RuntimeError):
     """A failure the model should see as a tool result, not a crash."""
@@ -175,6 +186,9 @@ class ExcelBridge:
         start_row: int | None = None,
         overwrite_sheet: bool = True,
         freeze: bool = True,
+        show_gridlines: bool = False,
+        border: bool = True,
+        alignment: dict[str, Any] | str | None = None,
     ) -> str:
         """Write a rectangular table to a sheet, creating the workbook if needed."""
         _validate_payload(rows)
@@ -189,6 +203,9 @@ class ExcelBridge:
             "start_row": start_row,
             "overwrite_sheet": overwrite_sheet,
             "freeze": freeze,
+            "show_gridlines": show_gridlines,
+            "border": border,
+            "alignment": alignment,
         })
         return json.dumps({
             "ok": True,
@@ -204,13 +221,20 @@ class ExcelBridge:
         path: str,
         edits: list[dict[str, Any]],
         sheet: str | None = None,
+        show_gridlines: bool | None = None,
+        border: bool | None = None,
     ) -> str:
         """Write individual cells. Each edit is {cell, value, format?}."""
         if not edits:
             raise ExcelToolError("edits is required and must be non-empty")
         if isinstance(edits, str):
             edits = json.loads(edits)
-        reply = self.call({"op": "edit", "path": path, "sheet": sheet, "edits": edits})
+        request = {"op": "edit", "path": path, "sheet": sheet, "edits": edits}
+        if show_gridlines is not None:
+            request["show_gridlines"] = show_gridlines
+        if border is not None:
+            request["border"] = border
+        reply = self.call(request)
         return json.dumps(reply, indent=2)
 
     def read_workbook(
@@ -273,7 +297,9 @@ def tools(bridge: ExcelBridge) -> list[dict[str, Any]]:
                     "`formats` maps a column header, letter, or 0-based index to a format: "
                     "currency, usd2, percent, percent2, multiple, date, datetime, int, number, "
                     "number2, signed_pct, signed_num, text, or a raw Excel format code. "
-                    "Numeric-looking strings ('1,250', '31.8%', '$12') are coerced to numbers."
+                    "Numeric-looking strings ('1,250', '31.8%', '$12') are coerced to numbers. "
+                    "The house look is gridlines off, columns centered, and a thin border "
+                    "around the table; set show_gridlines, border, or alignment to change it."
                 ),
                 "parameters": {
                     "type": "object",
@@ -306,6 +332,15 @@ def tools(bridge: ExcelBridge) -> list[dict[str, Any]]:
                             "description": "Replace an existing sheet of this name (default true)",
                         },
                         "freeze": {"type": "boolean", "description": "Freeze the header row"},
+                        "show_gridlines": {
+                            "type": "boolean",
+                            "description": "Show Excel's gridlines (default false)",
+                        },
+                        "border": {
+                            "type": "boolean",
+                            "description": "Draw a thin border box around the table (default true)",
+                        },
+                        "alignment": _ALIGNMENT_SPEC,
                     },
                     "required": ["path", "sheet", "rows"],
                 },
@@ -337,6 +372,8 @@ def tools(bridge: ExcelBridge) -> list[dict[str, Any]]:
                                 "required": ["cell"],
                             },
                         },
+                        "show_gridlines": {"type": "boolean"},
+                        "border": {"type": "boolean"},
                     },
                     "required": ["path", "edits"],
                 },

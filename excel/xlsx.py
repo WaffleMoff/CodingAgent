@@ -5,10 +5,10 @@ module speaks OOXML directly using only the standard library, which makes Excel
 support work in any image without a build step.
 
 It is deliberately narrow. It writes and reads rectangular sheets with typed
-cells, per-column number formats, and per-cell number-format overrides. That is
-everything the `excel_*` tools need. It is not a general Excel engine: no
-charts, no images, no pivot tables, no formula evaluation (formulas are stored;
-`read` reports the last cached value).
+cells, per-column number formats, per-cell number-format overrides, per-sheet
+gridline visibility, per-column alignment, and a table border. It is not a
+general Excel engine: no charts, no images, no pivot tables, no formula
+evaluation (formulas are stored; `read` reports the last cached value).
 
 Wire format
 -----------
@@ -27,6 +27,22 @@ override it (`sheet.cell_formats`), keyed by (row_index, col_index), both
 the column default, else General. This is what lets a date live in one cell of
 a column that otherwise holds numbers, without painting the whole column.
 
+Presentation model
+------------------
+Three sheet-level options drive everything visual, and all default to the
+known-good house look (see `Formatting Example.xlsx`) so an existing caller
+keeps a consistent, finished appearance:
+
+  * `show_gridlines` - Excel's sheet grid. Off by default; a bordered table
+    reads cleanly without it.
+  * `alignment` - per-column horizontal/vertical/wrap, keyed 0-based. Every
+    column defaults to centered and vertically centered.
+  * `border` - a thin box drawn around the used range of the table.
+
+A cellXf is one (role, number format, alignment, border) tuple. The writer
+registers every tuple a cell can reference, so a header cell can carry a
+data-only format and vice versa.
+
 Text columns use General (`numFmtId=0`), never Excel's built-in Text format
 (`numFmtId=49`): a number written into a 49-formatted cell renders blank.
 
@@ -37,6 +53,7 @@ Public API:
     book.get(name) / book.ensure(name) / book.remove(name)
     sheet.append(cells, formats=..) / sheet.add_rows(rows, headers=..)
     sheet.set_cell_format(row, col, code)
+    sheet.set_alignment(col, horizontal=.., vertical=.., wrap=..)
     book.save(path)
 
 Cell values may be str, int, float, bool, datetime.date, datetime.datetime,
@@ -97,6 +114,28 @@ MAX_SHEET_CHARS = 31
 _ILLEGAL_SHEET = re.compile(r"[\[\]:*?/\\]")
 _DATE_RE = re.compile(r"^(-?\d{4})-(\d{2})-(\d{2})(?:[T ](\d{2}):(\d{2})(?::(\d{2}))?)?")
 
+# The border variants the writer can address, keyed by which edges are drawn.
+# Order is fixed so a borderId is stable across runs. This is the full set the
+# box-around-used-range needs: interior cells carry no border, edge cells carry
+# one or two sides.
+BORDER_EDGES: tuple[tuple[str, ...], ...] = (
+    (),
+    ("left",),
+    ("right",),
+    ("top",),
+    ("bottom",),
+    ("left", "right"),
+    ("top", "bottom"),
+    ("left", "top", "right", "bottom"),
+)
+BORDER_INDEX = {edges: i for i, edges in enumerate(BORDER_EDGES)}
+
+HORIZONTAL_VALUES = {"left", "center", "right", "fill", "justify", "centerContinuous"}
+VERTICAL_VALUES = {"top", "center", "bottom", "justify"}
+
+# House default alignment applied to any column that does not override it.
+DEFAULT_ALIGNMENT = ("center", "center", False)
+
 
 class ExcelError(Exception):
     """Raised for malformed books or illegal operations."""
@@ -143,7 +182,7 @@ def _serial(value: _dt.date | _dt.datetime) -> float:
     return days
 
 
-def _from_serial(serial: float) -> _dt.datetime:
+def _from_serial(serial: float):
     epoch = _dt.datetime(1899, 12, 30)
     if serial >= 60:
         serial -= 1
@@ -152,7 +191,7 @@ def _from_serial(serial: float) -> _dt.datetime:
     except (OverflowError, ValueError):
         # Negative or absurd serial: hand the caller the raw number instead of
         # a date, so a bad format does not destroy the value.
-        return serial  # type: ignore[return-value]
+        return serial
 
 
 def _is_date_format(fmt: str) -> bool:
@@ -163,12 +202,14 @@ def _is_date_format(fmt: str) -> bool:
 
 
 class Sheet:
-    """A rectangular sheet: rows of Python values plus number formats.
+    """A rectangular sheet: rows of Python values plus formatting.
 
     Formats are held at two levels: `formats` is the per-column default and
     `cell_formats` is a per-cell override. Both are keyed 0-based. The
     effective format for a cell is cell override, else column default, else
     General.
+
+    Presentation is sheet-level: `show_gridlines`, `border`, and `alignment`.
     """
 
     def __init__(self, name: str, book: "Book | None" = None):
@@ -183,6 +224,11 @@ class Sheet:
         self.cell_formats: dict[tuple[int, int], str] = {}
         self.widths: dict[int, float] = {}
         self.frozen: str | None = None
+        # Presentation options.
+        self.show_gridlines: bool = False
+        self.border: bool = True
+        # column index -> (horizontal, vertical, wrap)
+        self.alignment: dict[int, tuple[str, str, bool]] = {}
 
     # -- construction ----------------------------------------------------
     def append(self, cells: list[object], formats: dict[int, str] | None = None) -> int:
@@ -279,6 +325,26 @@ class Sheet:
         if not isinstance(col, int) or col < 0:
             raise ExcelError(f"column index must be a non-negative int, got {col!r}")
         self.cell_formats[(row, col)] = number_format
+
+    def set_alignment(
+        self,
+        col: int,
+        horizontal: str = "center",
+        vertical: str = "center",
+        wrap: bool = False,
+    ) -> None:
+        """Set the alignment for a column (0-based). Header and body cells share it."""
+        if not isinstance(col, int) or col < 0:
+            raise ExcelError(f"column index must be a non-negative int, got {col!r}")
+        if horizontal not in HORIZONTAL_VALUES:
+            raise ExcelError(f"bad horizontal alignment {horizontal!r}")
+        if vertical not in VERTICAL_VALUES:
+            raise ExcelError(f"bad vertical alignment {vertical!r}")
+        self.alignment[col] = (horizontal, vertical, bool(wrap))
+
+    def alignment_for(self, col: int) -> tuple[str, str, bool]:
+        """Effective alignment for a column: explicit, else the house default."""
+        return self.alignment.get(col, DEFAULT_ALIGNMENT)
 
     def cell_format(self, row: int, col: int) -> str:
         """Effective format code for a cell: override, else column default."""
@@ -489,16 +555,59 @@ class Book:
             "</Relationships>"
         )
 
-    def _styles_xml(self) -> str:
-        """Style ids: one cellXf per (role, number format), see _cell_styles().
+    # -- styles ----------------------------------------------------------
+    def _style_axes(self) -> tuple[list[tuple[str, str, bool]], list[tuple[str, ...]]]:
+        """The alignment and border variants this workbook actually uses.
 
-        Shape matches the known-good raw-OOXML writer: cellStyleXfs and
-        cellStyles are present, borders contains only the default border, and
-        every cellXf carries xfId="0".
+        Alignment varies per column (only columns a cell references). Border
+        varies per cell edge, and only edges the used range needs. Keeping these
+        to the used set stops the cellXfs table from exploding on wide sheets.
         """
+        aligns: list[tuple[str, str, bool]] = []
+        seen_align: set[tuple[str, str, bool]] = set()
+
+        borders: list[tuple[str, ...]] = []
+        seen_border: set[tuple[str, ...]] = set()
+
+        def add_align(a):
+            if a not in seen_align:
+                seen_align.add(a)
+                aligns.append(a)
+
+        def add_border(b):
+            if b not in seen_border:
+                seen_border.add(b)
+                borders.append(b)
+
+        for sheet in self.sheets:
+            cols = set(sheet.formats) | set(sheet.widths)
+            cols |= {c for (_r, c) in sheet.cell_formats}
+            cols |= {c for (_r, c) in sheet._formulas}
+            cols = sorted(cols | {0, max(cols, default=0)})
+            for col in cols:
+                add_align(sheet.alignment_for(col))
+            # Alignment defaults matter even for a sheet with no body rows.
+            add_align(DEFAULT_ALIGNMENT)
+            if sheet.border and sheet.rows:
+                for edges in self._edge_variants(sheet):
+                    add_border(edges)
+            add_border(())
+        if not aligns:
+            add_align(DEFAULT_ALIGNMENT)
+        if not borders:
+            add_border(())
+        return aligns, borders
+
+    def _edge_variants(self, sheet: Sheet) -> set[tuple[str, ...]]:
+        """The distinct border-edge tuples the used range of `sheet` needs."""
+        return set(self._edge_map(sheet).values()) or {()}
+
+    def _styles_xml(self) -> str:
+        """One cellXf per (role, number format, alignment, border) combination."""
         fonts = (
             '<font><sz val="11"/><name val="Calibri"/></font>'
             '<font><b/><sz val="11"/><color rgb="FFFFFFFF"/><name val="Calibri"/></font>'
+            '<font><b/><sz val="11"/><color rgb="FF000000"/><name val="Calibri"/></font>'
         )
         fills = (
             '<fill><patternFill patternType="none"/></fill>'
@@ -506,22 +615,38 @@ class Book:
             '<fill><patternFill patternType="solid"><fgColor rgb="FF1F3864"/>'
             '<bgColor indexed="64"/></patternFill></fill>'
         )
-        borders = '<border><left/><right/><top/><bottom/><diagonal/></border>'
+        aligns, border_edges = self._style_axes()
+        borders = "".join(self._border_xml(edges) for edges in border_edges)
+        border_index = {edges: i for i, edges in enumerate(border_edges)}
+
+        # Body variants use fontId=0 (regular); plain headers use fontId=2 (bold,
+        # black) and the filled header uses fontId=1 (bold, white).
         xfs = []
-        for role, code in self._cell_styles():
+        lookup_cells = []
+        for role, code, align, edges in self._cell_styles(aligns, border_edges):
             fmt = self._format_id(code)
+            horizontal, vertical, wrap = align
+            alignment = (
+                f'<alignment horizontal="{horizontal}" vertical="{vertical}"'
+                + (' wrapText="1"' if wrap else "")
+                + "/>"
+            )
             if role == "header":
+                font, fill = 1, 2
                 xfs.append(
-                    f'<xf numFmtId="{fmt}" fontId="1" fillId="2" borderId="0" xfId="0" '
-                    'applyFont="1" applyFill="1" applyNumberFormat="1" '
-                    'applyAlignment="1"><alignment horizontal="center" '
-                    'vertical="center"/></xf>'
+                    f'<xf numFmtId="{fmt}" fontId="{font}" fillId="{fill}" '
+                    f'borderId="{border_index[edges]}" xfId="0" applyFont="1" '
+                    'applyFill="1" applyNumberFormat="1" applyBorder="1" '
+                    f'applyAlignment="1">{alignment}</xf>'
                 )
             else:
                 xfs.append(
-                    f'<xf numFmtId="{fmt}" fontId="0" fillId="0" borderId="0" xfId="0" '
-                    'applyNumberFormat="1"/>'
+                    f'<xf numFmtId="{fmt}" fontId="0" fillId="0" '
+                    f'borderId="{border_index[edges]}" xfId="0" '
+                    'applyNumberFormat="1" applyBorder="1" '
+                    f'applyAlignment="1">{alignment}</xf>'
                 )
+            lookup_cells.append((role, code, align, edges))
         custom = "".join(
             f'<numFmt numFmtId="{fid}" formatCode={quoteattr(code)}/>'
             for code, fid in sorted(self._custom_formats.items(), key=lambda kv: kv[1])
@@ -530,55 +655,103 @@ class Book:
             f'<numFmts count="{len(self._custom_formats)}">{custom}</numFmts>'
             if self._custom_formats else ""
         )
+        self._xf_lookup = {key: i for i, key in enumerate(lookup_cells)}
         return (
             '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
             f'<styleSheet xmlns="{NS_MAIN}">'
             f"{num_fmts}"
-            f'<fonts count="2">{fonts}</fonts>'
+            f'<fonts count="3">{fonts}</fonts>'
             f'<fills count="3">{fills}</fills>'
-            f'<borders count="1">{borders}</borders>'
+            f'<borders count="{len(border_edges)}">{borders}</borders>'
             '<cellStyleXfs count="1"><xf numFmtId="0" fontId="0" fillId="0" borderId="0"/></cellStyleXfs>'
             f'<cellXfs count="{len(xfs)}">{"".join(xfs)}</cellXfs>'
             '<cellStyles count="1"><cellStyle name="Normal" xfId="0" builtinId="0"/></cellStyles>'
             "</styleSheet>"
         )
 
-    def _cell_styles(self) -> list[tuple[str, str]]:
-        """Ordered list of (role, number_format_code); index == cellXf id.
+    def _cell_styles(
+        self,
+        aligns: list[tuple[str, str, bool]],
+        border_edges: list[tuple[str, ...]],
+    ) -> list[tuple[str, str, tuple, tuple[str, ...]]]:
+        """Ordered list of style keys; index == cellXf id.
 
-        Every (role, format) pair that any cell can reference must exist here,
-        and a header cell must be able to reference a data-only format (a
-        single-row sheet has no body row to carry it). Body is registered first
-        so the header cell can fall back to it.
+        Every (role, format, alignment, border) tuple a cell can reference must
+        exist here. Body is registered before header so a header cell can fall
+        back to a body style.
         """
-        styles: list[tuple[str, str]] = []
-        seen: set[tuple[str, str]] = set()
+        styles: list[tuple[str, str, tuple, tuple[str, ...]]] = []
+        seen: set[tuple] = set()
         for code in self._all_format_codes():
             for role in ("body", "header"):
-                pair = (role, code)
-                if pair not in seen:
-                    seen.add(pair)
-                    styles.append(pair)
+                for align in aligns:
+                    for edges in border_edges:
+                        key = (role, code, align, edges)
+                        if key not in seen:
+                            seen.add(key)
+                            styles.append(key)
         return styles
 
-    def _styles_lookup(self) -> dict[tuple[str, str], int]:
-        return {pair: i for i, pair in enumerate(self._cell_styles())}
+    @staticmethod
+    def _border_xml(edges: tuple[str, ...]) -> str:
+        parts = []
+        for side in ("left", "right", "top", "bottom"):
+            if side in edges:
+                parts.append(f'<{side} style="thin"><color indexed="64"/></{side}>')
+            else:
+                parts.append(f"<{side}/>")
+        parts.append("<diagonal/>")
+        return f"<border>{''.join(parts)}</border>"
+
+    # -- sheet -----------------------------------------------------------
+    def _edge_map(self, sheet: Sheet) -> dict[tuple[int, int], tuple[str, ...]]:
+        """Which border edges each cell needs, keyed (row0, col0), 0-based.
+
+        A full thin box around the used range: the top row gets `top`, the
+        bottom row `bottom`, the first column `left`, the last column `right`,
+        and interior cells get none.
+        """
+        if not sheet.border or not sheet.rows:
+            return {}
+        last_row = len(sheet.rows) - 1
+        last_col = max((len(r) for r in sheet.rows), default=1) - 1
+        edges: dict[tuple[int, int], tuple[str, ...]] = {}
+        for r, row in enumerate(sheet.rows):
+            for c in range(len(row)):
+                sides = []
+                if c == 0:
+                    sides.append("left")
+                if c == last_col:
+                    sides.append("right")
+                if r == 0:
+                    sides.append("top")
+                if r == last_row:
+                    sides.append("bottom")
+                if sides:
+                    edges[(r, c)] = tuple(s for s in ("left", "top", "right", "bottom") if s in sides)
+        return edges
 
     def _sheet_xml(self, sheet: Sheet) -> str:
-        lookup = self._styles_lookup()
+        lookup = getattr(self, "_xf_lookup", {})
+        edges_map = self._edge_map(sheet)
         has_header = bool(sheet.rows)
-        parts = [
-            '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>',
-            f'<worksheet xmlns="{NS_MAIN}">',
-        ]
+        view = (
+            f'<sheetView showGridLines="{1 if sheet.show_gridlines else 0}" '
+            'workbookViewId="0">'
+        )
         if sheet.frozen:
             col = _col_index(re.sub(r"\d", "", sheet.frozen)) if sheet.frozen[0].isalpha() else 0
             row = int(re.sub(r"\D", "", sheet.frozen) or "1") - 1
-            parts.append(
-                '<sheetViews><sheetView workbookViewId="0">'
-                f'<pane xSplit="{col}" ySplit="{row}" topLeftCell="{sheet.frozen}" activePane="bottomRight" state="frozen"/>'
-                "</sheetView></sheetViews>"
+            view += (
+                f'<pane xSplit="{col}" ySplit="{row}" topLeftCell="{sheet.frozen}" '
+                'activePane="bottomRight" state="frozen"/>'
             )
+        view += "</sheetView>"
+        parts = [
+            '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>',
+            f'<worksheet xmlns="{NS_MAIN}">',
+            f"<sheetViews>{view}</sheetViews>",
+        ]
         if sheet.widths:
             cols = "".join(
                 f'<col min="{i + 1}" max="{i + 1}" width="{w:.2f}" customWidth="1"/>'
@@ -589,19 +762,26 @@ class Book:
         for r, row in enumerate(sheet.rows, start=1):
             cells = []
             for c, raw in enumerate(row):
-                cells.append(self._cell_xml(r, c, raw, sheet, lookup, has_header))
+                cells.append(
+                    self._cell_xml(r, c, raw, sheet, lookup, has_header, edges_map)
+                )
             joined = "".join(cells)
             parts.append(f'<row r="{r}">{joined}</row>')
         parts.append("</sheetData></worksheet>")
         return "".join(parts)
 
-    def _cell_xml(self, row, col, value, sheet, lookup, has_header) -> str:
+    def _cell_xml(self, row, col, value, sheet, lookup, has_header, edges_map) -> str:
         ref = _coord(row, col)
         code = sheet.cell_format(row - 1, col)
         kind = "header" if (has_header and row == 1) else "body"
-        style = lookup.get((kind, code))
+        align = sheet.alignment_for(col)
+        edges = edges_map.get((row - 1, col), ())
+        style = lookup.get((kind, code, align, edges))
         if style is None:
-            style = lookup.get(("body", code), lookup.get(("body", "General"), 0))
+            style = lookup.get(("body", code, align, edges))
+        if style is None:
+            style = lookup.get(("body", "General", align, edges),
+                                lookup.get(("body", "General", align, ()), 0))
         formula = sheet._formulas.get((row - 1, col))
         if formula:
             body = f"<f>{escape(formula.lstrip('='))}</f>"
@@ -637,7 +817,6 @@ class Book:
 
 
 # ---------------------------------------------------------------- reading
-_XLSX_NS = {"m": NS_MAIN}
 _TAG = re.compile(r"\{[^}]*\}")
 _REF = re.compile(r"([A-Z]+)(\d+)")
 
@@ -704,8 +883,13 @@ def load_book(path: str) -> Book:
     return book
 
 
-def _read_styles(zf, names) -> list[str]:
-    """Return a list indexed by cellXf id -> number format code."""
+def _read_styles(zf, names) -> list[dict]:
+    """Decode the cellXfs table: one dict per cellXf id.
+
+    Each entry carries the number format code, the alignment, and the set of
+    drawn border edges, so the reader can recover everything the writer put on
+    a cell without re-parsing the sheet XML for it.
+    """
     if "xl/styles.xml" not in names:
         return []
     xml = zf.read("xl/styles.xml").decode("utf-8", "replace")
@@ -715,15 +899,41 @@ def _read_styles(zf, names) -> list[str]:
         code = _attr(raw, "formatCode")
         if fmt_id is not None and code is not None:
             custom[int(fmt_id)] = _unescape(code)
+
+    # Borders: one entry per registered border, each a set of drawn edges.
+    border_block = re.search(r"<borders[^>]*>(.*?)</borders>", xml, re.DOTALL)
+    border_edges: list[tuple[str, ...]] = []
+    if border_block:
+        for border in re.findall(r"<border>(.*?)</border>", border_block.group(1), re.DOTALL):
+            sides = []
+            for side in ("left", "right", "top", "bottom"):
+                m = re.search(rf"<{side}\b([^>]*)/?>", border)
+                if m and "style=" in m.group(1):
+                    sides.append(side)
+            border_edges.append(tuple(s for s in ("left", "top", "right", "bottom") if s in sides))
+
     block = re.search(r"<cellXfs[^>]*>(.*?)</cellXfs>", xml, re.DOTALL)
     if not block:
         return []
-    formats = []
-    for xf in re.findall(r"<xf\b[^>]*>", block.group(1)):
+    styles = []
+    for xf_match in re.finditer(r"<xf\b([^>]*?)(?:/>|>(.*?)</xf>)", block.group(1), re.DOTALL):
+        xf, body = xf_match.group(1), xf_match.group(2) or ""
         raw_id = _attr(xf, "numFmtId")
         fmt_id = int(raw_id) if raw_id is not None else 0
-        formats.append(custom.get(fmt_id, BUILTIN_FORMATS.get(fmt_id, "General")))
-    return formats
+        code = custom.get(fmt_id, BUILTIN_FORMATS.get(fmt_id, "General"))
+        bid = _attr(xf, "borderId")
+        edges = border_edges[int(bid)] if bid and int(bid) < len(border_edges) else ()
+        align_match = re.search(r"<alignment\b([^>]*)/?>", body)
+        alignment = None
+        if align_match:
+            a = align_match.group(1)
+            alignment = (
+                _attr(a, "horizontal") or "center",
+                _attr(a, "vertical") or "center",
+                _attr(a, "wrapText") == "1",
+            )
+        styles.append({"format": code, "alignment": alignment, "border": edges})
+    return styles
 
 
 def _read_shared_strings(zf, names) -> list[str]:
@@ -733,10 +943,14 @@ def _read_shared_strings(zf, names) -> list[str]:
     return [_unescape(_cell_text(si)) for si in re.findall(r"<si>(.*?)</si>", xml, re.DOTALL)]
 
 
-def _read_sheet(xml: str, name: str, styles: list[str], shared: list[str]) -> Sheet:
+def _read_sheet(xml: str, name: str, styles: list[dict], shared: list[str]) -> Sheet:
     sheet = Sheet(name)
     seen_formats: dict[int, str] = {}
     header_formats: dict[int, str] = {}
+    view = re.search(r"<sheetView\b([^>]*)>", xml)
+    if view:
+        grid = _attr(view.group(1), "showGridLines")
+        sheet.show_gridlines = (grid != "0")
     for row_match in re.finditer(r"<row\b[^>]*>(.*?)</row>", xml, re.DOTALL):
         values: list[object] = []
         for cell_match in re.finditer(r"<c\b([^>]*)(?:/>|>(.*?)</c>)", row_match.group(1), re.DOTALL):
@@ -749,7 +963,12 @@ def _read_sheet(xml: str, name: str, styles: list[str], shared: list[str]) -> Sh
             ctype = ctype.group(1) if ctype else "n"
             style_id = re.search(r's="(\d+)"', attrs)
             style_id = int(style_id.group(1)) if style_id else 0
-            fmt = styles[style_id] if style_id < len(styles) else "General"
+            style = styles[style_id] if style_id < len(styles) else {"format": "General", "alignment": None, "border": ()}
+            fmt = style["format"]
+            if style["alignment"]:
+                sheet.alignment.setdefault(col, style["alignment"])
+            if style["border"]:
+                sheet.border = True
             is_header_row = not sheet.rows
             formula = re.search(r"<f[^>]*>(.*?)</f>", body, re.DOTALL)
             if formula:
@@ -829,6 +1048,10 @@ def describe(sheet: Sheet, *, max_rows: int = 10) -> dict:
         for (row, col), fmt in sorted(sheet.cell_formats.items())
         if fmt != "General"
     }
+    alignment = {
+        _col_letter(col): {"horizontal": h, "vertical": v, "wrap": w}
+        for col, (h, v, w) in sorted(sheet.alignment.items())
+    }
     return {
         "sheet": sheet.name,
         "rows": len(sheet.rows),
@@ -836,6 +1059,9 @@ def describe(sheet: Sheet, *, max_rows: int = 10) -> dict:
         "headers": [str(h) if h is not None else "" for h in sheet.header],
         "number_formats": column_formats,
         "cell_number_formats": cell_formats,
+        "gridlines": sheet.show_gridlines,
+        "bordered": sheet.border,
+        "alignment": alignment,
         "preview": preview,
         "formulas": len(sheet._formulas),
     }

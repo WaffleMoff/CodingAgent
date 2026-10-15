@@ -153,6 +153,87 @@ def parse_formats(raw, columns: list[str] | None) -> dict[int, str]:
     raise ValueError("formats must be a list or an object")
 
 
+def parse_alignment(raw, columns: list[str] | None) -> dict[int, tuple[str, str, bool]]:
+    """Normalise the `alignment` request into {col: (horizontal, vertical, wrap)}.
+
+    Accepted shapes:
+      * {"2": "left"}                     - column 2 left-aligned, vertical center
+      * {"Revenue": {"horizontal": "left", "wrap": true}}
+      * {"horizontal": "left"}            - the default for every column
+      * "left"                            - shorthand for the every-column default
+    A scalar value sets the horizontal axis; vertical stays center.
+    """
+    out: dict[int, tuple[str, str, bool]] = {}
+    if raw is None:
+        return out
+    if isinstance(raw, str):
+        raw = json.loads(raw)
+
+    def one(value, *, base=("center", "center", False)):
+        horizontal, vertical, wrap = base
+        if isinstance(value, str):
+            horizontal = value
+        elif isinstance(value, dict):
+            horizontal = value.get("horizontal", horizontal)
+            vertical = value.get("vertical", vertical)
+            wrap = bool(value.get("wrap", wrap))
+        else:
+            raise ValueError(f"alignment value {value!r} must be a string or an object")
+        if horizontal not in xlsx.HORIZONTAL_VALUES or vertical not in xlsx.VERTICAL_VALUES:
+            raise ValueError(f"bad alignment {horizontal!r}/{vertical!r}")
+        return (horizontal, vertical, wrap)
+
+    # A bare string or an object that is itself an alignment spec is the default
+    # for all columns; an object keyed by column names/indexes is per-column.
+    spec_keys = {"horizontal", "vertical", "wrap"}
+    if isinstance(raw, dict) and set(raw) & spec_keys:
+        default = one(raw)
+        out["*"] = default
+        return out
+    if not isinstance(raw, dict):
+        raise ValueError("alignment must be a string or an object")
+
+    default = ("center", "center", False)
+    for key, value in raw.items():
+        text = str(key).strip()
+        if text in spec_keys:
+            continue
+        if text.isdigit():
+            out[int(text)] = one(value, base=default)
+        elif columns and text in columns:
+            out[columns.index(text)] = one(value, base=default)
+        elif re.fullmatch(r"[A-Za-z]{1,3}", text):
+            out[xlsx._col_index(text)] = one(value, base=default)
+        else:
+            raise ValueError(
+                f"alignment key {key!r} is neither a position, a column letter, nor a header"
+            )
+    if "horizontal" in raw or "vertical" in raw or "wrap" in raw:
+        out["*"] = one({k: raw[k] for k in spec_keys if k in raw})
+    return out
+
+
+def _apply_presentation(sheet, request, columns, ncols: int) -> None:
+    """Apply gridlines, alignment, and border options to a freshly written sheet.
+
+    Every option is opt-out: omit it and the sheet gets the house look (no
+    gridlines, centered columns, a thin box border), which is what
+    `Formatting Example.xlsx` shows.
+    """
+    if "show_gridlines" in request:
+        sheet.show_gridlines = bool(request["show_gridlines"])
+    if "border" in request:
+        sheet.border = bool(request["border"])
+
+    alignment = parse_alignment(request.get("alignment"), columns)
+    default = alignment.pop("*", None)
+    for col in range(ncols):
+        # An explicit per-column spec wins over the sheet-wide default.
+        spec = alignment.get(col, default)
+        if spec is not None:
+            sheet.set_alignment(col, *spec)
+
+
 def _date_columns(formats: dict[int, str]) -> set[int]:
     return {col for col, code in formats.items() if xlsx._is_date_format(code)}
 
@@ -210,6 +291,7 @@ def op_create(request) -> dict:
     )
     sheet.set_widths({0: 24, 1: 48})
     sheet.freeze("A2")
+    _apply_presentation(sheet, request, None, 2)
     book.save(path)
     return {"ok": True, "path": os.path.abspath(path), "sheets": book.names(),
             "rows": {"Cover": len(sheet)}}
@@ -273,6 +355,15 @@ def op_write(request) -> dict:
     if request.get("freeze", True) and sheet.rows:
         sheet.freeze("A2")
 
+    ncols = max(
+        [len(headers) if headers else 0]
+        + [len(r) for r in body]
+        + [c + 1 for c in formats]
+        + [c + 1 for c in sheet.widths]
+        + [0]
+    )
+    _apply_presentation(sheet, request, columns, ncols)
+
     book.save(path)
     return {
         "ok": True,
@@ -322,6 +413,11 @@ def op_edit(request) -> dict:
             sheet.set_format_at(key, resolve_format(request["set_format"]))
         else:
             sheet.set_format(key, resolve_format(request["set_format"]))
+
+    if "show_gridlines" in request:
+        sheet.show_gridlines = bool(request["show_gridlines"])
+    if "border" in request:
+        sheet.border = bool(request["border"])
 
     book.save(path)
     return {"ok": True, "path": os.path.abspath(path), "sheet": sheet.name,
